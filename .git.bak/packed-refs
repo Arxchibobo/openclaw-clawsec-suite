@@ -1,0 +1,78 @@
+# pack-refs with: peeled fully-peeled sorted 
+14623d8ed1e98ee2ebf90f7afa56a24a4e9062d0 refs/remotes/origin/auto-claude/004-llm-based-security-analyst-skill
+c47893b909405f10046a893e26ccf3b5b1b0cad8 refs/remotes/origin/auto-claude/005-automated-vulnerability-scanner-skill
+b7bcb9e830642f3b1d1a7cac7f75c27976aa0269 refs/remotes/origin/auto-claude/009-add-audit-warning-when-clawsec-verify-checksum-man
+022924d5ad8e3510610fcd74069a84151de48493 refs/remotes/origin/automated/nvd-cve-update-22514881695
+64a972b4e03672493c8c38f0b75fbf95dcfa4a53 refs/remotes/origin/automated/nvd-cve-update-22537431068
+d9f673e8be89e08a3f0d9e7027970eaf76261c5a refs/remotes/origin/automated/nvd-cve-update-22548015965
+2ae475975f58eb4d96cae109898bdc08e2f01298 refs/remotes/origin/automated/nvd-cve-update-22548076070
+a8f482c9f219dfc697acb8f9ed8efd1889071d7a refs/remotes/origin/dependabot/github_actions/actions/setup-python-6.2.0
+04f12205432411dac69a59cc329001bee299a827 refs/remotes/origin/dependabot/github_actions/actions/upload-artifact-7.0.0
+b79c56cc2dc63c3d7a111b3629f5924b58febb59 refs/remotes/origin/dependabot/github_actions/aquasecurity/trivy-action-0.34.2
+abb3d4bb24181e22288c4864ddc9097d95816d59 refs/remotes/origin/dependabot/github_actions/github/codeql-action-4.32.5
+46295b889f1d675ae5980bdcab7a0286c8a047a6 refs/remotes/origin/dependabot/npm_and_yarn/eslint/js-9.39.3
+5f467771f224db7740de5a0a3048a0f73de34f20 refs/remotes/origin/dependabot/npm_and_yarn/lucide-react-0.576.0
+5c74e146850f7b73fbb84831dbd7a78846b7a002 refs/remotes/origin/dependabot/npm_and_yarn/types/node-25.3.3
+9fd7c1bdd3198087ac5f1cee5ef5b08a7ff7601d refs/remotes/origin/dependabot/npm_and_yarn/typescript-5.9.3
+8947cfa3b8c8ca1326695fa9357aabfc5099b29f refs/remotes/origin/dependabot/pip/dot-github/bandit-1.9.4
+1ff80a9721764131b737b7bf60cac3e29c258749 refs/remotes/origin/dependabot/pip/dot-github/ruff-0.15.4
+79c303fa3f68f5f79be5e16fcba2ae397c4c472e refs/remotes/origin/main
+c19074f7c1a88818935f4fd767eab1975aff5883 refs/tags/clawsec-clawhub-checker-v0.0.1
+^b1df24a468928f547d12979d9a519cd5b0b1e680
+e0a5e7c1a195f40c22b6a541fe3df8bcdfb6f426 refs/tags/clawsec-feed-v0.0.1
+^8c91b4391147ab95a1c95b8814add789e189c199
+5074103e0718b861b9f4a223225920f60f5fcac0 refs/tags/clawsec-feed-v0.0.2
+^446cc690ddfc5ce6320207beaa8d2d27645e2571
+b9762c86d689b529c8b338e34119e254122ede40 refs/tags/clawsec-feed-v0.0.3
+^8c4f7d594c2bfbe2d7089abfcd385bc69a037847
+c8fe2a256c62899b7efe4573d26becb6a290900e refs/tags/clawsec-feed-v0.0.4
+^db091fb8b30c7d159aeb8a7907b546aea9934dae
+41d3553ab700e75171388a7e6c86dd4ac31b6332 refs/tags/clawsec-feed-v0.0.5
+^79c303fa3f68f5f79be5e16fcba2ae397c4c472e
+d372f72e3f480883f76fab1c8a50d62e6fc788ca refs/tags/clawsec-nanoclaw-v0.0.1
+^73dd63f7144772c314df403a28c162b78eb619ce
+496ed484fb4213dc1b4bfc1d92cbf10fd168b7f9 refs/tags/clawsec-nanoclaw-v0.0.2
+^79c303fa3f68f5f79be5e16fcba2ae397c4c472e
+17311495c287f73f7e45912cdc91fa2756dbb4b7 refs/tags/clawsec-suite-v0.0.1
+3b26f6d5811bad6ab4c22e412150712d966d987d refs/tags/clawsec-suite-v0.0.10
+^76778b8bb65af2cfff09b7caed365869a51690b4
+63b0ecda5af1136da5a374d6ac03d3d438d00f94 refs/tags/clawsec-suite-v0.0.2
+^a18d37f69b34dd6f1822d5cef05788a6e90a2ab8
+5ddcf963c20b751500e649fc9bad66811565257d refs/tags/clawsec-suite-v0.0.3
+^e90a6306a946a0a78de2029f0ef7decec0d0bb22
+5cff60d66b295fad71f49c168cdfccf8edd04506 refs/tags/clawsec-suite-v0.0.4
+^c31b81f24f7090c9981105297f5ad3143622d829
+dc186e95e414acb69a02605eab0cb2c445ede9b6 refs/tags/clawsec-suite-v0.0.5
+^fae4444526b7d5563b3f5318372611cacd7f481a
+54ace7b17d88cde43eff0e70227ec746b8ec0697 refs/tags/clawsec-suite-v0.0.6
+^c7749e6d5af032daac8f1d16aec806606c5deeca
+c7a5271b39db4fca3eef2cc09c6bebdee948f6d0 refs/tags/clawsec-suite-v0.0.8
+^83ec542a1e95306c5b46cad3b57856cf264ef9fb
+9cc7d70af117f54070c50987ce831472918f4409 refs/tags/clawsec-suite-v0.0.9
+^905561d6f7d0d97d1e37612c0627b460fc5f41b5
+197ea8ce5fffbd19084bd6a6609a50a5a4abc22c refs/tags/clawsec-suite-v0.1.1
+^aa563e8c0e57817420d765a407b2cce7172758ad
+182940de8c5f34a8236418d9c5d4a9e08b77046a refs/tags/clawsec-suite-v0.1.2
+^4af71d45c7e9c430ce7a94f08b83cbbf564555a8
+581f69065be78e3a0ccdf1698e6b86ac8b0a7963 refs/tags/clawsec-suite-v0.1.3
+^7cdb4ab7e245d210b8cacf66874f9eb491e93464
+55a25095f6eef5178d3346ec858003d81379d57a refs/tags/clawsec-suite-v0.1.4
+^79c303fa3f68f5f79be5e16fcba2ae397c4c472e
+93ae4c2b84cd9fa1db09c82500cf8300c26e6d17 refs/tags/clawtributor-v0.0.1
+^8c91b4391147ab95a1c95b8814add789e189c199
+5583b9b9caed168dd2f7b7100323d1f77b4528c3 refs/tags/clawtributor-v0.0.2
+^334731f3237c01e8ac2844f5cdd8dd71cb841ce1
+b040ce271a8539b2e9efa6779f51ddf30fcb78b3 refs/tags/clawtributor-v0.0.3
+^fdaa933a24f4ec470eea228acac574b3de638861
+79de50a53a210b2c4fb390e908bc9c657d2a0072 refs/tags/openclaw-audit-watchdog-v0.0.1
+^7bfb9ec0d1ed31b5b9b178a7e8a01fed415e6ce0
+93a6195468b8ee0c721912d36d64e6640dfac913 refs/tags/openclaw-audit-watchdog-v0.0.3
+^24b5bf9f1b5ef33a0e9b4ec79ba81e6255d8f1c6
+11dcbb5948d5a263084937136e754ba499b96e3a refs/tags/openclaw-audit-watchdog-v0.0.4
+^760e49f3e089d2ee9b269c89a469da1a3e255084
+9f3d6e7ea6e630c44e2dae57d416f8ff1a792088 refs/tags/openclaw-audit-watchdog-v0.1.0
+^4af71d45c7e9c430ce7a94f08b83cbbf564555a8
+246a818349297089ef843ee8b672f8b924ec1e99 refs/tags/openclaw-audit-watchdog-v0.1.1
+^7cdb4ab7e245d210b8cacf66874f9eb491e93464
+9adac19159e167ca46c9b2ec38e2a38edaef8988 refs/tags/soul-guardian-v0.0.2
+^87f80aae949b650d35fedeaab9f842f2b0b2164c

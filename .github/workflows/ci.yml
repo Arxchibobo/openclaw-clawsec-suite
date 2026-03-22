@@ -1,0 +1,136 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  lint-typescript:
+    name: Lint TypeScript/React (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: ESLint
+        run: npx eslint . --ext .ts,.tsx,.js,.jsx,.mjs --max-warnings 0
+      - name: TypeScript Check
+        run: npx tsc --noEmit
+      - name: Build Check
+        if: matrix.os == 'ubuntu-latest'
+        run: npm run build
+
+  lint-python:
+    name: Lint Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+      - name: Ruff (lint + format check)
+        run: pipx run --spec "ruff==0.6.9" ruff check utils/ --output-format=github
+      - name: Bandit (security)
+        run: pipx run --spec "bandit==1.7.9" bandit -r utils/ -ll
+
+  lint-shell:
+    name: Lint Shell Scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: ShellCheck
+        uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38 # 2.0.0
+        with:
+          scandir: './scripts'
+          severity: warning
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Trivy FS Scan
+        uses: aquasecurity/trivy-action@e368e328979b113139d6f9068e03accaed98a518 # 0.34.1
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+          ignore-unfixed: true
+      - name: Trivy Config Scan
+        uses: aquasecurity/trivy-action@e368e328979b113139d6f9068e03accaed98a518 # 0.34.1
+        with:
+          scan-type: 'config'
+          scan-ref: '.'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+
+  dependency-audit:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: npm audit
+        run: npm audit --audit-level=high --registry=https://registry.npmjs.org
+      - name: Check for outdated deps
+        run: npm outdated || true
+
+  clawsec-suite-tests:
+    name: ClawSec Suite Verification Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: Feed Verification Tests
+        run: node skills/clawsec-suite/test/feed_verification.test.mjs
+      - name: Guarded Install Tests
+        run: node skills/clawsec-suite/test/guarded_install.test.mjs
+      - name: Advisory Suppression Tests
+        run: node skills/clawsec-suite/test/advisory_suppression.test.mjs
+      - name: Path Resolution Tests
+        run: node skills/clawsec-suite/test/path_resolution.test.mjs
+      - name: Fuzz Property Tests
+        run: node skills/clawsec-suite/test/fuzz_properties.test.mjs
+      - name: Semver/Scope/Suppression Fuzz Tests
+        run: node skills/clawsec-suite/test/fuzz_semver_scope_suppression.test.mjs
+      - name: Advisory Application Scope Tests
+        run: node skills/clawsec-suite/test/advisory_application_scope.test.mjs
+
+  openclaw-audit-watchdog-tests:
+    name: OpenClaw Audit Watchdog Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: Suppression Config Tests
+        run: node skills/openclaw-audit-watchdog/test/suppression_config.test.mjs
+      - name: Suppression Config Fuzz Tests
+        run: node skills/openclaw-audit-watchdog/test/suppression_config_fuzz.test.mjs
+      - name: Render Report Suppression Tests
+        run: node skills/openclaw-audit-watchdog/test/render_report_suppression.test.mjs

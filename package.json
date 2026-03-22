@@ -1,0 +1,43 @@
+{
+  "name": "ClawSec",
+  "private": true,
+  "license": "AGPL-3.0-or-later",
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "gen:wiki-llms": "node scripts/generate-wiki-llms.mjs",
+    "populate-local-wiki": "./scripts/populate-local-wiki.sh",
+    "predev": "npm run gen:wiki-llms",
+    "dev": "vite",
+    "prebuild": "npm run gen:wiki-llms",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "lucide-react": "^0.575.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "react-markdown": "^10.1.0",
+    "react-router-dom": "^7.13.1",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "~9.28.0",
+    "@types/node": "^25.2.3",
+    "@typescript-eslint/eslint-plugin": "^8.55.0",
+    "@typescript-eslint/parser": "^8.56.0",
+    "@vitejs/plugin-react": "^5.1.4",
+    "eslint": "^9.39.2",
+    "eslint-plugin-react": "^7.37.5",
+    "eslint-plugin-react-hooks": "^7.0.1",
+    "fast-check": "^4.5.3",
+    "typescript": "~5.8.2",
+    "vite": "^7.3.1"
+  },
+  "overrides": {
+    "ajv": "6.14.0",
+    "balanced-match": "4.0.3",
+    "brace-expansion": "5.0.2",
+    "minimatch": "10.2.4"
+  }
+}

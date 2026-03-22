@@ -1,0 +1,898 @@
+name: Poll NVD CVEs
+
+on:
+  schedule:
+    # Run daily at 06:00 UTC
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_full_scan:
+        description: 'Ignore feed state and rebuild CVE advisories from full NVD history'
+        required: false
+        default: 'false'
+        type: boolean
+
+permissions: read-all
+
+concurrency:
+  group: poll-nvd-cves
+  cancel-in-progress: false
+
+env:
+  FEED_PATH: advisories/feed.json
+  FEED_SIG_PATH: advisories/feed.json.sig
+  SKILL_FEED_PATH: skills/clawsec-feed/advisories/feed.json
+  SKILL_FEED_SIG_PATH: skills/clawsec-feed/advisories/feed.json.sig
+  KEYWORDS: "OpenClaw clawdbot Moltbot NanoClaw WhatsApp-bot baileys"
+  GITHUB_REF_PATTERN: "github.com/openclaw/openclaw github.com/qwibitai/NanoClaw"
+
+jobs:
+  poll-and-update:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 1
+
+      - name: Get last poll date from feed
+        id: last_poll
+        run: |
+          if [ -f "$FEED_PATH" ]; then
+            LAST_UPDATED=$(jq -r '.updated // empty' "$FEED_PATH")
+            if [ -n "$LAST_UPDATED" ] && [ "${{ inputs.force_full_scan }}" != "true" ]; then
+              echo "last_date=$LAST_UPDATED" >> $GITHUB_OUTPUT
+              echo "Found last updated: $LAST_UPDATED"
+            else
+              # Default to 120 days ago if no date found or force scan
+              LAST_UPDATED=$(date -u -d '120 days ago' +%Y-%m-%dT%H:%M:%S.000Z 2>/dev/null || date -u -v-120d +%Y-%m-%dT%H:%M:%S.000Z)
+              echo "last_date=$LAST_UPDATED" >> $GITHUB_OUTPUT
+              echo "Using default date: $LAST_UPDATED"
+            fi
+          else
+            LAST_UPDATED=$(date -u -d '120 days ago' +%Y-%m-%dT%H:%M:%S.000Z 2>/dev/null || date -u -v-120d +%Y-%m-%dT%H:%M:%S.000Z)
+            echo "last_date=$LAST_UPDATED" >> $GITHUB_OUTPUT
+            echo "No feed found, using default: $LAST_UPDATED"
+          fi
+
+      - name: Set date window
+        id: dates
+        run: |
+          START_DATE="${{ steps.last_poll.outputs.last_date }}"
+          END_DATE=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+          
+          # Convert to epoch for comparison
+          START_EPOCH=$(date -d "$START_DATE" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%S" "${START_DATE%.*}" +%s)
+          END_EPOCH=$(date -d "$END_DATE" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%S" "${END_DATE%.*}" +%s)
+          
+          # Ensure start date is before end date (NVD returns 404 if start > end)
+          if [ "$START_EPOCH" -ge "$END_EPOCH" ]; then
+            echo "Warning: Start date ($START_DATE) is not before end date ($END_DATE)"
+            echo "Adjusting start date to 24 hours before end date"
+            START_EPOCH=$((END_EPOCH - 86400))
+            START_DATE=$(date -u -d "@$START_EPOCH" +%Y-%m-%dT%H:%M:%S.000Z 2>/dev/null || date -u -r "$START_EPOCH" +%Y-%m-%dT%H:%M:%S.000Z)
+          fi
+          
+          echo "start_date=$START_DATE" >> $GITHUB_OUTPUT
+          echo "end_date=$END_DATE" >> $GITHUB_OUTPUT
+          echo "Polling window: $START_DATE to $END_DATE"
+
+      - name: Fetch CVEs from NVD
+        id: fetch
+        run: |
+          set -euo pipefail
+          mkdir -p tmp
+          FORCE_FULL_SCAN="${{ inputs.force_full_scan }}"
+          
+          START_DATE="${{ steps.dates.outputs.start_date }}"
+          END_DATE="${{ steps.dates.outputs.end_date }}"
+          
+          # URL encode the dates
+          START_ENC=$(echo "$START_DATE" | sed 's/:/%3A/g')
+          END_ENC=$(echo "$END_DATE" | sed 's/:/%3A/g')
+          
+          echo "=== Fetching CVEs from NVD ==="
+
+          FAILED_KEYWORDS=()
+          
+          # Fetch for each keyword
+          for KEYWORD in $KEYWORDS; do
+            echo "Fetching keyword: $KEYWORD"
+
+            keyword_ok=false
+            last_http_code=""
+
+            if [ "$FORCE_FULL_SCAN" = "true" ]; then
+              echo "Full scan mode enabled: paginating complete NVD history for keyword '$KEYWORD'"
+              echo '{"vulnerabilities":[]}' > "tmp/nvd_${KEYWORD}.json"
+              START_INDEX=0
+              RESULTS_PER_PAGE=2000
+
+              while true; do
+                URL="https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=${KEYWORD}&startIndex=${START_INDEX}&resultsPerPage=${RESULTS_PER_PAGE}"
+                PAGE_FILE="tmp/nvd_${KEYWORD}_${START_INDEX}.json"
+                echo "URL: $URL"
+
+                page_ok=false
+                for i in 1 2 3; do
+                  HTTP_CODE=$(curl -sS -w "%{http_code}" -o "$PAGE_FILE" "$URL" || true)
+                  if [ -z "$HTTP_CODE" ]; then
+                    HTTP_CODE="000"
+                  fi
+                  last_http_code="$HTTP_CODE"
+                  if [ "$HTTP_CODE" = "200" ]; then
+                    if jq -e . "$PAGE_FILE" >/dev/null 2>&1; then
+                      page_ok=true
+                      break
+                    fi
+                    echo "Invalid JSON for $KEYWORD page $START_INDEX, retry $i..."
+                    sleep 5
+                  elif [ "$HTTP_CODE" = "403" ] || [ "$HTTP_CODE" = "429" ]; then
+                    echo "Rate limited, waiting 30s before retry $i..."
+                    sleep 30
+                  else
+                    echo "HTTP $HTTP_CODE for $KEYWORD page $START_INDEX, retry $i..."
+                    sleep 5
+                  fi
+                done
+
+                if [ "$page_ok" != "true" ]; then
+                  break
+                fi
+
+                jq -s '.[0].vulnerabilities += .[1].vulnerabilities | .[0]' \
+                  "tmp/nvd_${KEYWORD}.json" "$PAGE_FILE" > "tmp/nvd_${KEYWORD}_merged.json"
+                mv "tmp/nvd_${KEYWORD}_merged.json" "tmp/nvd_${KEYWORD}.json"
+
+                PAGE_COUNT=$(jq '.vulnerabilities | length' "$PAGE_FILE")
+                TOTAL_RESULTS=$(jq '.totalResults // 0' "$PAGE_FILE")
+                echo "Fetched $PAGE_COUNT results at startIndex=$START_INDEX (totalResults=$TOTAL_RESULTS)"
+
+                START_INDEX=$((START_INDEX + RESULTS_PER_PAGE))
+                if [ "$START_INDEX" -ge "$TOTAL_RESULTS" ] || [ "$PAGE_COUNT" -eq 0 ]; then
+                  keyword_ok=true
+                  break
+                fi
+
+                # NVD recommends 6 second delay between requests
+                sleep 6
+              done
+            else
+              URL="https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=${KEYWORD}&lastModStartDate=${START_ENC}&lastModEndDate=${END_ENC}"
+              echo "URL: $URL"
+
+              # Fetch with retry logic
+              for i in 1 2 3; do
+                HTTP_CODE=$(curl -sS -w "%{http_code}" -o "tmp/nvd_${KEYWORD}.json" "$URL" || true)
+                if [ -z "$HTTP_CODE" ]; then
+                  HTTP_CODE="000"
+                fi
+                last_http_code="$HTTP_CODE"
+                if [ "$HTTP_CODE" = "200" ]; then
+                  if jq -e . "tmp/nvd_${KEYWORD}.json" >/dev/null 2>&1; then
+                    echo "Success for $KEYWORD"
+                    keyword_ok=true
+                    break
+                  fi
+                  echo "Invalid JSON for $KEYWORD, retry $i..."
+                  sleep 5
+                elif [ "$HTTP_CODE" = "403" ] || [ "$HTTP_CODE" = "429" ]; then
+                  echo "Rate limited, waiting 30s before retry $i..."
+                  sleep 30
+                else
+                  echo "HTTP $HTTP_CODE for $KEYWORD, retry $i..."
+                  sleep 5
+                fi
+              done
+            fi
+
+            if [ "$keyword_ok" != "true" ]; then
+              echo "::error::Failed to fetch valid NVD response for keyword '$KEYWORD' (last HTTP code: ${last_http_code:-unknown})."
+              FAILED_KEYWORDS+=("$KEYWORD")
+            fi
+            
+            # NVD recommends 6 second delay between requests
+            sleep 6
+          done
+          
+          if [ "${#FAILED_KEYWORDS[@]}" -gt 0 ]; then
+            echo "::error::NVD fetch failed for keyword(s): ${FAILED_KEYWORDS[*]}"
+            exit 1
+          fi
+
+          echo "=== Fetch complete ==="
+          ls -la tmp/
+
+      - name: Merge and filter CVEs
+        id: process
+        run: |
+          # Combine all fetched CVEs
+          echo '{"vulnerabilities":[]}' > tmp/combined.json
+          
+          for KEYWORD in $KEYWORDS; do
+            FILE="tmp/nvd_${KEYWORD}.json"
+            if [ -f "$FILE" ] && [ -s "$FILE" ]; then
+              # Check if file has vulnerabilities array
+              if jq -e '.vulnerabilities' "$FILE" > /dev/null 2>&1; then
+                COUNT=$(jq '.vulnerabilities | length' "$FILE")
+                echo "Found $COUNT CVEs for keyword search"
+                
+                # Merge into combined
+                jq -s '.[0].vulnerabilities += .[1].vulnerabilities | .[0]' \
+                  tmp/combined.json "$FILE" > tmp/combined_new.json
+                mv tmp/combined_new.json tmp/combined.json
+              fi
+            fi
+          done
+          
+          # Deduplicate by CVE ID
+          jq '.vulnerabilities | unique_by(.cve.id)' tmp/combined.json > tmp/unique_cves.json
+          TOTAL=$(jq 'length' tmp/unique_cves.json)
+          echo "Total unique CVEs from NVD: $TOTAL"
+          
+          # Post-filter: keep only CVEs where description contains keywords OR references contain github pattern
+          KEYWORDS_PATTERN="OpenClaw|clawdbot|Moltbot|openclaw|NanoClaw|nanoclaw|WhatsApp-bot|baileys"
+          GITHUB_PATTERN="${GITHUB_REF_PATTERN}"
+          
+          jq --arg kw "$KEYWORDS_PATTERN" --arg gh "$GITHUB_PATTERN" '
+            [.[] | select(
+              # Check if any description contains keywords (case insensitive)
+              (.cve.descriptions[]? | select(.lang == "en") | .value | test($kw; "i"))
+              or
+              # Check if any reference URL contains the github pattern
+              (.cve.references[]? | .url | test($gh; "i"))
+            )]
+          ' tmp/unique_cves.json > tmp/filtered_cves.json
+          
+          FILTERED=$(jq 'length' tmp/filtered_cves.json)
+          echo "Filtered CVEs (matching criteria): $FILTERED"
+          echo "filtered_count=$FILTERED" >> $GITHUB_OUTPUT
+
+      - name: Get existing advisories
+        id: existing
+        run: |
+          if [ -f "$FEED_PATH" ]; then
+            jq -r '.advisories[]?.id // empty' "$FEED_PATH" | sort -u > tmp/existing_ids.txt
+            # Also extract full existing advisories for update comparison
+            jq '.advisories // []' "$FEED_PATH" > tmp/existing_advisories.json
+          else
+            touch tmp/existing_ids.txt
+            echo '[]' > tmp/existing_advisories.json
+          fi
+
+          EXISTING_COUNT=$(wc -l < tmp/existing_ids.txt | tr -d ' ')
+          echo "Existing advisories: $EXISTING_COUNT"
+          cat tmp/existing_ids.txt
+
+      - name: Check for updates to existing advisories
+        id: updates
+        run: |
+          if [ "${{ inputs.force_full_scan }}" = "true" ]; then
+            echo "Full scan mode enabled: skipping delta update detection."
+            echo '[]' > tmp/updated_advisories.json
+            echo "Advisories to update: 0"
+            echo "update_count=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Compare existing CVE advisories against NVD data for changes
+          # Only check advisories that start with "CVE-" (NVD-sourced)
+
+          jq '
+            def map_severity:
+              if . == null then "medium"
+              elif . >= 9.0 then "critical"
+              elif . >= 7.0 then "high"
+              elif . >= 4.0 then "medium"
+              else "low"
+              end;
+
+            def get_cvss_score:
+              .cve.metrics.cvssMetricV31[0]?.cvssData.baseScore //
+              .cve.metrics.cvssMetricV30[0]?.cvssData.baseScore //
+              .cve.metrics.cvssMetricV2[0]?.cvssData.baseScore //
+              null;
+
+            def nvd_category_raw:
+              (
+                [.cve.weaknesses[]?.description[]? | select(.lang == "en") | .value | strings | select(length > 0)]
+                | unique
+                | map(select(. != "NVD-CWE-noinfo" and . != "NVD-CWE-Other"))
+                | .[0]
+              );
+
+            def cwe_id:
+              (
+                nvd_category_raw
+                | if . == null then null
+                  else (try (capture("^CWE-(?<id>[0-9]+)$").id) catch null)
+                  end
+              );
+
+            def cwe_name_map($id):
+              ({
+                "20": "improper_input_validation",
+                "22": "path_traversal",
+                "77": "command_injection",
+                "78": "os_command_injection",
+                "79": "cross_site_scripting",
+                "89": "sql_injection",
+                "94": "code_injection",
+                "119": "memory_buffer_bounds_violation",
+                "120": "classic_buffer_overflow",
+                "125": "out_of_bounds_read",
+                "134": "format_string_vulnerability",
+                "200": "exposure_of_sensitive_information",
+                "250": "execution_with_unnecessary_privileges",
+                "269": "improper_privilege_management",
+                "284": "improper_access_control",
+                "285": "improper_authorization",
+                "287": "improper_authentication",
+                "295": "improper_certificate_validation",
+                "306": "missing_authentication_for_critical_function",
+                "319": "cleartext_transmission_of_sensitive_information",
+                "326": "inadequate_encryption_strength",
+                "327": "risky_cryptographic_algorithm",
+                "352": "cross_site_request_forgery",
+                "362": "race_condition",
+                "400": "uncontrolled_resource_consumption",
+                "416": "use_after_free",
+                "434": "unrestricted_file_upload",
+                "502": "deserialization_of_untrusted_data",
+                "601": "open_redirect",
+                "611": "xml_external_entity_injection",
+                "639": "insecure_direct_object_reference",
+                "668": "exposure_of_resource_to_wrong_sphere",
+                "669": "incorrect_resource_transfer_between_spheres",
+                "732": "incorrect_permission_assignment",
+                "787": "out_of_bounds_write",
+                "798": "hard_coded_credentials",
+                "862": "missing_authorization",
+                "863": "incorrect_authorization",
+                "918": "server_side_request_forgery",
+                "922": "insecure_storage_of_sensitive_information"
+              }[$id]);
+
+            def nvd_category_name:
+              (
+                cwe_id as $id
+                | if $id == null then "unspecified_weakness"
+                  else (cwe_name_map($id) // ("unknown_cwe_" + $id))
+                  end
+              );
+
+            def cpe_criteria:
+              (
+                [.cve.configurations[]? | .. | objects | .criteria? | strings | select(startswith("cpe:2.3:"))]
+                | unique
+              );
+
+            def context_blob:
+              (
+                [
+                  (.cve.descriptions[]? | select(.lang == "en") | .value),
+                  (.cve.references[]?.url // empty)
+                ]
+                | map(strings | ascii_downcase)
+                | join(" ")
+              );
+
+            def inferred_targets:
+              (
+                context_blob as $blob
+                | (
+                    (if ($blob | test("github\\.com/openclaw/openclaw|\\bopenclaw\\b|\\bclawdbot\\b|\\bmoltbot\\b")) then ["openclaw@*"] else [] end)
+                    + (if ($blob | test("github\\.com/qwibitai/nanoclaw|\\bnanoclaw\\b|whatsapp-bot|\\bbaileys\\b")) then ["nanoclaw@*"] else [] end)
+                  )
+              );
+
+            def normalized_affected:
+              (
+                (cpe_criteria + inferred_targets)
+                | unique
+                | .[0:5]
+                | if length == 0 then ["openclaw@*", "nanoclaw@*"] else . end
+              );
+
+            def normalized_platforms:
+              (
+                inferred_targets as $targets
+                | ($targets | map(select(startswith("openclaw@"))) | length > 0) as $has_openclaw
+                | ($targets | map(select(startswith("nanoclaw@"))) | length > 0) as $has_nanoclaw
+                | if $has_openclaw and $has_nanoclaw then ["openclaw", "nanoclaw"]
+                  elif $has_openclaw then ["openclaw"]
+                  elif $has_nanoclaw then ["nanoclaw"]
+                  else ["openclaw", "nanoclaw"]
+                  end
+              );
+
+            [.[] | {
+              id: .cve.id,
+              severity: (get_cvss_score | map_severity),
+              type: nvd_category_name,
+              nvd_category_id: nvd_category_raw,
+              cvss_score: get_cvss_score,
+              description: (.cve.descriptions[] | select(.lang == "en") | .value),
+              title: (.cve.descriptions[] | select(.lang == "en") | .value | .[0:100] + (if length > 100 then "..." else "" end)),
+              affected: normalized_affected,
+              platforms: normalized_platforms,
+              references: [.cve.references[]?.url // empty] | unique | .[0:3],
+              exploitability_score: null,
+              exploitability_rationale: null
+            }]
+          ' tmp/filtered_cves.json > tmp/nvd_current_state.json
+
+          # Find updates: existing CVE advisories where NVD data differs
+          jq -n --slurpfile existing tmp/existing_advisories.json --slurpfile nvd tmp/nvd_current_state.json '
+            # Get only CVE-prefixed existing advisories
+            ($existing[0] | map(select(.id | startswith("CVE-")))) as $cve_advisories |
+
+            # For each NVD entry, check if it exists and has changes
+            [
+              $nvd[0][] |
+              . as $nvd_entry |
+              ($cve_advisories | map(select(.id == $nvd_entry.id)) | first) as $existing_entry |
+              if $existing_entry then
+                # Compare key fields
+                if ($existing_entry.severity != $nvd_entry.severity) or
+                   ($existing_entry.type != $nvd_entry.type) or
+                   ($existing_entry.nvd_category_id != $nvd_entry.nvd_category_id) or
+                   ($existing_entry.cvss_score != $nvd_entry.cvss_score) or
+                   ($existing_entry.affected != $nvd_entry.affected) or
+                   ($existing_entry.platforms != $nvd_entry.platforms) or
+                   ($existing_entry.description != $nvd_entry.description) then
+                  {
+                    id: $nvd_entry.id,
+                    changes: (
+                      []
+                      + (if $existing_entry.severity != $nvd_entry.severity then ["severity: \($existing_entry.severity) → \($nvd_entry.severity)"] else [] end)
+                      + (if $existing_entry.type != $nvd_entry.type then ["type: \($existing_entry.type // "null") → \($nvd_entry.type // "null")"] else [] end)
+                      + (if $existing_entry.nvd_category_id != $nvd_entry.nvd_category_id then ["nvd_category_id: \($existing_entry.nvd_category_id // "null") → \($nvd_entry.nvd_category_id // "null")"] else [] end)
+                      + (if $existing_entry.cvss_score != $nvd_entry.cvss_score then ["cvss_score: \($existing_entry.cvss_score // "null") → \($nvd_entry.cvss_score // "null")"] else [] end)
+                      + (if $existing_entry.affected != $nvd_entry.affected then ["affected targets updated"] else [] end)
+                      + (if $existing_entry.platforms != $nvd_entry.platforms then ["platforms updated"] else [] end)
+                      + (if $existing_entry.description != $nvd_entry.description then ["description updated"] else [] end)
+                    ),
+                    updated_fields: {
+                      severity: $nvd_entry.severity,
+                      type: $nvd_entry.type,
+                      nvd_category_id: $nvd_entry.nvd_category_id,
+                      cvss_score: $nvd_entry.cvss_score,
+                      affected: $nvd_entry.affected,
+                      platforms: $nvd_entry.platforms,
+                      description: $nvd_entry.description,
+                      title: $nvd_entry.title,
+                      references: $nvd_entry.references
+                    }
+                  }
+                else
+                  empty
+                end
+              else
+                empty
+              end
+            ]
+          ' > tmp/updated_advisories.json
+
+          UPDATE_COUNT=$(jq 'length' tmp/updated_advisories.json)
+          echo "Advisories to update: $UPDATE_COUNT"
+          echo "update_count=$UPDATE_COUNT" >> $GITHUB_OUTPUT
+
+          if [ "$UPDATE_COUNT" -gt 0 ]; then
+            echo "=== Updated advisories ==="
+            jq -r '.[] | "- \(.id): \(.changes | join(", "))"' tmp/updated_advisories.json
+          fi
+
+      - name: Transform CVEs to advisories
+        id: transform
+        run: |
+          # Read existing IDs into a jq-friendly format
+          if [ "${{ inputs.force_full_scan }}" = "true" ]; then
+            echo "Full scan mode enabled: rebuilding CVE advisories from scratch."
+            EXISTING_IDS='[]'
+          else
+            EXISTING_IDS=$(cat tmp/existing_ids.txt | jq -R -s 'split("\n") | map(select(length > 0))')
+          fi
+          
+          # Transform NVD CVEs to our advisory format
+          jq --argjson existing "$EXISTING_IDS" '
+            def map_severity:
+              if . == null then "medium"
+              elif . >= 9.0 then "critical"
+              elif . >= 7.0 then "high"
+              elif . >= 4.0 then "medium"
+              else "low"
+              end;
+            
+            def get_cvss_score:
+              .cve.metrics.cvssMetricV31[0]?.cvssData.baseScore //
+              .cve.metrics.cvssMetricV30[0]?.cvssData.baseScore //
+              .cve.metrics.cvssMetricV2[0]?.cvssData.baseScore //
+              null;
+
+            def nvd_category_raw:
+              (
+                [.cve.weaknesses[]?.description[]? | select(.lang == "en") | .value | strings | select(length > 0)]
+                | unique
+                | map(select(. != "NVD-CWE-noinfo" and . != "NVD-CWE-Other"))
+                | .[0]
+              );
+
+            def cwe_id:
+              (
+                nvd_category_raw
+                | if . == null then null
+                  else (try (capture("^CWE-(?<id>[0-9]+)$").id) catch null)
+                  end
+              );
+
+            def cwe_name_map($id):
+              ({
+                "20": "improper_input_validation",
+                "22": "path_traversal",
+                "77": "command_injection",
+                "78": "os_command_injection",
+                "79": "cross_site_scripting",
+                "89": "sql_injection",
+                "94": "code_injection",
+                "119": "memory_buffer_bounds_violation",
+                "120": "classic_buffer_overflow",
+                "125": "out_of_bounds_read",
+                "134": "format_string_vulnerability",
+                "200": "exposure_of_sensitive_information",
+                "250": "execution_with_unnecessary_privileges",
+                "269": "improper_privilege_management",
+                "284": "improper_access_control",
+                "285": "improper_authorization",
+                "287": "improper_authentication",
+                "295": "improper_certificate_validation",
+                "306": "missing_authentication_for_critical_function",
+                "319": "cleartext_transmission_of_sensitive_information",
+                "326": "inadequate_encryption_strength",
+                "327": "risky_cryptographic_algorithm",
+                "352": "cross_site_request_forgery",
+                "362": "race_condition",
+                "400": "uncontrolled_resource_consumption",
+                "416": "use_after_free",
+                "434": "unrestricted_file_upload",
+                "502": "deserialization_of_untrusted_data",
+                "601": "open_redirect",
+                "611": "xml_external_entity_injection",
+                "639": "insecure_direct_object_reference",
+                "668": "exposure_of_resource_to_wrong_sphere",
+                "669": "incorrect_resource_transfer_between_spheres",
+                "732": "incorrect_permission_assignment",
+                "787": "out_of_bounds_write",
+                "798": "hard_coded_credentials",
+                "862": "missing_authorization",
+                "863": "incorrect_authorization",
+                "918": "server_side_request_forgery",
+                "922": "insecure_storage_of_sensitive_information"
+              }[$id]);
+
+            def nvd_category_name:
+              (
+                cwe_id as $id
+                | if $id == null then "unspecified_weakness"
+                  else (cwe_name_map($id) // ("unknown_cwe_" + $id))
+                  end
+              );
+
+            def cpe_criteria:
+              (
+                [.cve.configurations[]? | .. | objects | .criteria? | strings | select(startswith("cpe:2.3:"))]
+                | unique
+              );
+
+            def context_blob:
+              (
+                [
+                  (.cve.descriptions[]? | select(.lang == "en") | .value),
+                  (.cve.references[]?.url // empty)
+                ]
+                | map(strings | ascii_downcase)
+                | join(" ")
+              );
+
+            def inferred_targets:
+              (
+                context_blob as $blob
+                | (
+                    (if ($blob | test("github\\.com/openclaw/openclaw|\\bopenclaw\\b|\\bclawdbot\\b|\\bmoltbot\\b")) then ["openclaw@*"] else [] end)
+                    + (if ($blob | test("github\\.com/qwibitai/nanoclaw|\\bnanoclaw\\b|whatsapp-bot|\\bbaileys\\b")) then ["nanoclaw@*"] else [] end)
+                  )
+              );
+
+            def normalized_affected:
+              (
+                (cpe_criteria + inferred_targets)
+                | unique
+                | .[0:5]
+                | if length == 0 then ["openclaw@*", "nanoclaw@*"] else . end
+              );
+
+            def normalized_platforms:
+              (
+                inferred_targets as $targets
+                | ($targets | map(select(startswith("openclaw@"))) | length > 0) as $has_openclaw
+                | ($targets | map(select(startswith("nanoclaw@"))) | length > 0) as $has_nanoclaw
+                | if $has_openclaw and $has_nanoclaw then ["openclaw", "nanoclaw"]
+                  elif $has_openclaw then ["openclaw"]
+                  elif $has_nanoclaw then ["nanoclaw"]
+                  else ["openclaw", "nanoclaw"]
+                  end
+              );
+            
+            [.[] |
+              select(.cve.id as $id | $existing | index($id) | not) |
+              {
+                id: .cve.id,
+                severity: (get_cvss_score | map_severity),
+                type: nvd_category_name,
+                nvd_category_id: nvd_category_raw,
+                title: (.cve.descriptions[] | select(.lang == "en") | .value | .[0:100] + (if length > 100 then "..." else "" end)),
+                description: (.cve.descriptions[] | select(.lang == "en") | .value),
+                affected: normalized_affected,
+                platforms: normalized_platforms,
+                action: "Review and update affected components. See NVD for remediation details.",
+                published: .cve.published,
+                references: [.cve.references[]?.url // empty] | unique | .[0:3],
+                cvss_score: get_cvss_score,
+                nvd_url: ("https://nvd.nist.gov/vuln/detail/" + .cve.id),
+                exploitability_score: null,
+                exploitability_rationale: null
+              }
+            ]
+          ' tmp/filtered_cves.json > tmp/new_advisories.json
+          
+          NEW_COUNT=$(jq 'length' tmp/new_advisories.json)
+          echo "New advisories to add: $NEW_COUNT"
+          echo "new_count=$NEW_COUNT" >> $GITHUB_OUTPUT
+          
+          if [ "$NEW_COUNT" -gt 0 ]; then
+            echo "=== New advisories ==="
+            jq '.[].id' tmp/new_advisories.json
+          fi
+
+      - name: Set up Python for exploitability analysis
+        if: steps.transform.outputs.new_count != '0'
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: '3.10'
+
+      - name: Analyze exploitability for new advisories
+        if: steps.transform.outputs.new_count != '0'
+        run: |
+          set -euo pipefail
+
+          echo "=== Analyzing exploitability for new advisories ==="
+
+          # Extract CVSS vectors from filtered CVEs to merge with advisories
+          jq '
+            [.[] | {
+              id: .cve.id,
+              cvss_vector: (
+                .cve.metrics.cvssMetricV31[0]?.cvssData.vectorString //
+                .cve.metrics.cvssMetricV30[0]?.cvssData.vectorString //
+                .cve.metrics.cvssMetricV2[0]?.vectorString //
+                ""
+              )
+            }] | map({(.id): .cvss_vector}) | add
+          ' tmp/filtered_cves.json > tmp/cvss_vectors.json
+
+          scripts/ci/enrich_exploitability.sh \
+            --mode batch \
+            --input tmp/new_advisories.json \
+            --output tmp/new_advisories.json \
+            --cvss-vectors tmp/cvss_vectors.json
+
+          echo "=== Exploitability analysis complete ==="
+
+          # Show summary of exploitability scores
+          echo "Exploitability score distribution:"
+          jq -r '.[] | "\(.id): \(.exploitability_score // "unknown")"' tmp/new_advisories.json | \
+            awk -F': ' '{scores[$2]++} END {for (s in scores) print "  " s ": " scores[s]}'
+
+      - name: Update feed.json
+        if: steps.transform.outputs.new_count != '0' || steps.updates.outputs.update_count != '0'
+        run: |
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          FORCE_FULL_SCAN="${{ inputs.force_full_scan }}"
+
+          if [ -f "$FEED_PATH" ] && [ "$FORCE_FULL_SCAN" = "true" ]; then
+            # Full scan mode: replace all CVE advisories with rebuilt set and keep non-CVE entries.
+            jq --argjson rebuilt "$(cat tmp/new_advisories.json)" --arg now "$NOW" '
+              .updated = $now |
+              .advisories = (
+                ((.advisories // []) | map(select((.id // "") | startswith("CVE-") | not)))
+                + $rebuilt
+                | sort_by(.published)
+                | reverse
+              )
+            ' "$FEED_PATH" > tmp/updated_feed.json
+          elif [ -f "$FEED_PATH" ]; then
+            # Step 1: Apply updates to existing advisories
+            jq --slurpfile updates tmp/updated_advisories.json '
+              .advisories = [
+                .advisories[] |
+                . as $adv |
+                ($updates[0] | map(select(.id == $adv.id)) | first) as $update |
+                if $update then
+                  # Merge updated fields
+                  ($adv * $update.updated_fields)
+                else
+                  $adv
+                end
+              ]
+            ' "$FEED_PATH" > tmp/feed_with_updates.json
+
+            # Step 2: Add new advisories
+            jq --argjson new "$(cat tmp/new_advisories.json)" --arg now "$NOW" '
+              .updated = $now |
+              .advisories = (.advisories + $new | sort_by(.published) | reverse)
+            ' tmp/feed_with_updates.json > tmp/updated_feed.json
+          else
+            jq -n --argjson advisories "$(cat tmp/new_advisories.json)" --arg now "$NOW" '{
+              version: "1.0.0",
+              updated: $now,
+              description: "Community-driven security advisory feed for ClawSec",
+              advisories: ($advisories | sort_by(.published) | reverse)
+            }' > tmp/updated_feed.json
+          fi
+
+          # Validate JSON
+          if jq empty tmp/updated_feed.json 2>/dev/null; then
+            echo "Feed JSON is valid"
+            mv tmp/updated_feed.json "$FEED_PATH"
+
+            # Also update the skill feed
+            mkdir -p "$(dirname "$SKILL_FEED_PATH")"
+            cp "$FEED_PATH" "$SKILL_FEED_PATH"
+
+            echo "=== Updated feeds ==="
+            echo "Main feed: $FEED_PATH"
+            echo "Skill feed: $SKILL_FEED_PATH"
+            jq '.advisories | length' "$FEED_PATH"
+          else
+            echo "Error: Generated invalid JSON"
+            exit 1
+          fi
+
+      - name: Sign advisory feed and verify
+        if: steps.transform.outputs.new_count != '0' || steps.updates.outputs.update_count != '0'
+        uses: ./.github/actions/sign-and-verify
+        with:
+          private_key: ${{ secrets.CLAWSEC_SIGNING_PRIVATE_KEY }}
+          private_key_passphrase: ${{ secrets.CLAWSEC_SIGNING_PRIVATE_KEY_PASSPHRASE }}
+          input_file: ${{ env.FEED_PATH }}
+          signature_file: ${{ env.FEED_SIG_PATH }}
+          verify_files: |
+            ${{ env.FEED_PATH }}
+            ${{ env.SKILL_FEED_PATH }}
+
+      - name: Sync advisory signature to skill feed
+        if: steps.transform.outputs.new_count != '0' || steps.updates.outputs.update_count != '0'
+        run: cp "$FEED_SIG_PATH" "$SKILL_FEED_SIG_PATH"
+
+      - name: Clean workspace for PR
+        if: steps.transform.outputs.new_count != '0' || steps.updates.outputs.update_count != '0'
+        run: |
+          # Reset any unintended changes, keep only feed files
+          git checkout -- .github/ 2>/dev/null || true
+          git clean -fd .github/ 2>/dev/null || true
+
+      - name: Create Pull Request
+        if: steps.transform.outputs.new_count != '0' || steps.updates.outputs.update_count != '0'
+        id: create-pr
+        uses: peter-evans/create-pull-request@c0f553fe549906ede9cf27b5156039d195d2ece0 # v8.1.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: automated/nvd-cve-update-${{ github.run_id }}
+          delete-branch: true
+          title: "chore: CVE advisories - ${{ steps.transform.outputs.new_count }} new, ${{ steps.updates.outputs.update_count }} updated"
+          body: |
+            ## Summary
+            Automated update from NVD CVE feed.
+
+            - **Mode:** ${{ inputs.force_full_scan == true && 'full-rebuild (ignore feed state)' || 'delta (incremental)' }}
+            - **New advisories:** ${{ steps.transform.outputs.new_count }}
+            - **Updated advisories:** ${{ steps.updates.outputs.update_count }}
+            - **Poll window:** ${{ steps.dates.outputs.start_date }} → ${{ steps.dates.outputs.end_date }}
+            - **Keywords:** ${{ env.KEYWORDS }}
+
+            ---
+            *This PR was automatically generated by the NVD CVE polling workflow.*
+          commit-message: |
+            chore: CVE advisories - ${{ steps.transform.outputs.new_count }} new, ${{ steps.updates.outputs.update_count }} updated
+
+            Automated update from NVD CVE feed.
+            Keywords: ${{ env.KEYWORDS }}
+            Poll window: ${{ steps.dates.outputs.start_date }} to ${{ steps.dates.outputs.end_date }}
+          add-paths: |
+            ${{ env.FEED_PATH }}
+            ${{ env.FEED_SIG_PATH }}
+            ${{ env.SKILL_FEED_PATH }}
+            ${{ env.SKILL_FEED_SIG_PATH }}
+
+      - name: Run CodeQL on generated PR branch
+        if: steps.create-pr.outputs.pull-request-number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          BRANCH="${{ steps.create-pr.outputs.pull-request-branch }}"
+          if [ -z "$BRANCH" ]; then
+            echo "::error::Missing pull-request-branch output from create-pull-request"
+            exit 1
+          fi
+
+          echo "Dispatching CodeQL for branch: $BRANCH"
+          gh workflow run codeql.yml --ref "$BRANCH"
+
+          RUN_ID=""
+          for _ in $(seq 1 30); do
+            RUN_ID=$(gh run list \
+              --workflow "CodeQL" \
+              --branch "$BRANCH" \
+              --event workflow_dispatch \
+              --json databaseId,createdAt \
+              --jq 'sort_by(.createdAt) | last | .databaseId // empty')
+            if [ -n "$RUN_ID" ]; then
+              break
+            fi
+            sleep 5
+          done
+
+          if [ -z "$RUN_ID" ]; then
+            echo "::error::Unable to locate dispatched CodeQL run for branch $BRANCH"
+            exit 1
+          fi
+
+          echo "Waiting for CodeQL run id: $RUN_ID"
+          gh run watch "$RUN_ID" --exit-status
+
+      - name: Summary
+        run: |
+          if [ "${{ inputs.force_full_scan }}" = "true" ]; then
+            MODE="full-rebuild (ignore feed state)"
+          else
+            MODE="delta (incremental)"
+          fi
+
+          echo "## NVD CVE Poll Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Mode | $MODE |" >> $GITHUB_STEP_SUMMARY
+          echo "| Poll Window | ${{ steps.dates.outputs.start_date }} → ${{ steps.dates.outputs.end_date }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Keywords | $KEYWORDS |" >> $GITHUB_STEP_SUMMARY
+          echo "| CVEs Found (filtered) | ${{ steps.process.outputs.filtered_count }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| New Advisories | ${{ steps.transform.outputs.new_count }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Updated Advisories | ${{ steps.updates.outputs.update_count }} |" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.transform.outputs.new_count }}" != "0" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### New Advisories" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            jq -r '.[] | "- **\(.id)** (\(.severity)): \(.title)"' tmp/new_advisories.json >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ steps.updates.outputs.update_count }}" != "0" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Updated Advisories" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            jq -r '.[] | "- **\(.id)**: \(.changes | join(", "))"' tmp/updated_advisories.json >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ steps.transform.outputs.new_count }}" != "0" ] || [ "${{ steps.updates.outputs.update_count }}" != "0" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "🔀 Created PR: ${{ steps.create-pr.outputs.pull-request-url }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ No new or updated CVEs found." >> $GITHUB_STEP_SUMMARY
+          fi

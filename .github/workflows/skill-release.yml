@@ -1,0 +1,1175 @@
+name: Skill Release
+
+on:
+  push:
+    tags:
+      - '*-v[0-9]*.[0-9]*.[0-9]*'
+  pull_request:
+    paths:
+      - 'skills/*/skill.json'
+      - 'skills/*/SKILL.md'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to re-publish to ClawHub (e.g., clawsec-suite-v0.0.10)'
+        required: true
+        type: string
+
+permissions: read-all
+
+concurrency:
+  group: skill-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate-pr-version-sync:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Verify signing key consistency (repo + docs)
+        run: ./scripts/ci/verify_signing_key_consistency.sh
+
+      - name: Validate version parity for bumped skills
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          get_md_version() {
+            local md_file="$1"
+            awk '
+              NR == 1 && $0 == "---" { in_frontmatter = 1; next }
+              in_frontmatter && $0 == "---" { exit }
+              in_frontmatter && $0 ~ /^version:[[:space:]]*/ {
+                sub(/^version:[[:space:]]*/, "", $0)
+                gsub(/[[:space:]]+$/, "", $0)
+                print $0
+                exit
+              }
+            ' "$md_file"
+          }
+
+          get_md_version_from_git() {
+            local sha="$1"
+            local path="$2"
+            local tmp_file
+            tmp_file="$(mktemp)"
+
+            if git cat-file -e "${sha}:${path}" 2>/dev/null; then
+              git show "${sha}:${path}" > "$tmp_file"
+              get_md_version "$tmp_file"
+            fi
+
+            rm -f "$tmp_file"
+          }
+
+          touched_skills_file="$(mktemp)"
+          git diff --name-only "${BASE_SHA}...${HEAD_SHA}" -- 'skills/*/skill.json' 'skills/*/SKILL.md' \
+            | awk -F/ 'NF >= 3 {print $1 "/" $2}' \
+            | sort -u > "${touched_skills_file}"
+
+          if [ ! -s "${touched_skills_file}" ]; then
+            echo "No skill metadata files changed in this PR."
+            rm -f "${touched_skills_file}"
+            exit 0
+          fi
+
+          checked_skills=0
+          failures=0
+
+          while IFS= read -r skill_dir; do
+            json_path="${skill_dir}/skill.json"
+            md_path="${skill_dir}/SKILL.md"
+
+            head_json_version=""
+            if [ -f "${json_path}" ]; then
+              head_json_version="$(jq -r '.version // empty' "${json_path}" 2>/dev/null || true)"
+            fi
+
+            head_md_version=""
+            if [ -f "${md_path}" ]; then
+              head_md_version="$(get_md_version "${md_path}")"
+            fi
+
+            base_json_version=""
+            if git cat-file -e "${BASE_SHA}:${json_path}" 2>/dev/null; then
+              base_json_version="$(git show "${BASE_SHA}:${json_path}" | jq -r '.version // empty' 2>/dev/null || true)"
+            fi
+
+            base_md_version="$(get_md_version_from_git "${BASE_SHA}" "${md_path}")"
+
+            json_version_changed=false
+            md_version_changed=false
+
+            if [ "${head_json_version}" != "${base_json_version}" ]; then
+              json_version_changed=true
+            fi
+
+            if [ "${head_md_version}" != "${base_md_version}" ]; then
+              md_version_changed=true
+            fi
+
+            if [ "${json_version_changed}" != "true" ] && [ "${md_version_changed}" != "true" ]; then
+              echo "No version bump detected for ${skill_dir}; skipping."
+              continue
+            fi
+
+            checked_skills=$((checked_skills + 1))
+            echo "Version bump detected for ${skill_dir} (skill.json changed: ${json_version_changed}, SKILL.md changed: ${md_version_changed})"
+
+            if [ ! -f "${json_path}" ]; then
+              echo "::error file=${json_path}::Missing skill.json after version bump."
+              failures=$((failures + 1))
+              continue
+            fi
+
+            if [ ! -f "${md_path}" ]; then
+              echo "::error file=${md_path}::Missing SKILL.md after version bump."
+              failures=$((failures + 1))
+              continue
+            fi
+
+            if [ -z "${head_json_version}" ]; then
+              echo "::error file=${json_path}::Missing .version in skill.json."
+              failures=$((failures + 1))
+              continue
+            fi
+
+            if [ -z "${head_md_version}" ]; then
+              echo "::error file=${md_path}::Missing version in SKILL.md frontmatter."
+              failures=$((failures + 1))
+              continue
+            fi
+
+            if [ "${head_json_version}" != "${head_md_version}" ]; then
+              echo "::error file=${json_path}::Version mismatch. skill.json=${head_json_version}, SKILL.md=${head_md_version}"
+              failures=$((failures + 1))
+              continue
+            fi
+
+            echo "Version parity OK for ${skill_dir}: ${head_json_version}"
+          done < "${touched_skills_file}"
+
+          rm -f "${touched_skills_file}"
+
+          if [ "${checked_skills}" -eq 0 ]; then
+            echo "No version bumps detected in changed skill metadata files."
+            exit 0
+          fi
+
+          if [ "${failures}" -gt 0 ]; then
+            echo "::error::Found ${failures} version parity issue(s) across ${checked_skills} bumped skill(s)."
+            exit 1
+          fi
+
+          echo "Validated ${checked_skills} bumped skill(s): skill.json and SKILL.md versions are present and equal."
+
+  release:
+    if: github.event_name == 'pull_request'
+    needs: validate-pr-version-sync
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Generate test signing key for dry-run
+        run: |
+          set -euo pipefail
+          echo "Generating temporary Ed25519 test key for dry-run validation"
+          umask 077
+          mkdir -p /tmp/test-signing
+          # Use Ed25519 to match production signing (not RSA)
+          openssl genpkey -algorithm ED25519 -out /tmp/test-signing/private.pem
+          openssl pkey -in /tmp/test-signing/private.pem -pubout -out /tmp/test-signing/public.pem
+          echo "TEST_SIGNING_KEY_DIR=/tmp/test-signing" >> $GITHUB_ENV
+
+      - name: Run release dry-run for changed skills
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          # Helper function to sign advisory artifacts with test key (dry-run only)
+          sign_advisory_artifacts() {
+            local skill_dir="$1"
+            local advisory_dir="${skill_dir}/advisories"
+
+            if [ ! -d "$advisory_dir" ] || [ ! -f "$advisory_dir/feed.json" ]; then
+              return 0
+            fi
+
+            echo "  [Dry-run] Signing advisory artifacts with test key"
+
+            local key_file="$TEST_SIGNING_KEY_DIR/private.pem"
+            local pub_file="$TEST_SIGNING_KEY_DIR/public.pem"
+            local tmp_sig_bin
+
+            # Sign feed.json with Ed25519 (requires -rawin flag)
+            openssl pkeyutl -sign -rawin -inkey "$key_file" -in "$advisory_dir/feed.json" | \
+              openssl base64 -A > "$advisory_dir/feed.json.sig"
+
+            # Verify Ed25519 feed.json signature (requires -rawin flag)
+            tmp_sig_bin=$(mktemp)
+            openssl base64 -d -A -in "$advisory_dir/feed.json.sig" -out "$tmp_sig_bin"
+            if ! openssl pkeyutl -verify -rawin -pubin -inkey "$pub_file" -sigfile "$tmp_sig_bin" -in "$advisory_dir/feed.json" >/dev/null 2>&1; then
+              echo "::error file=${skill_dir}/advisories/feed.json.sig::Feed signature verification failed after signing"
+              rm -f "$tmp_sig_bin"
+              return 1
+            fi
+            rm -f "$tmp_sig_bin"
+            echo "  [Dry-run] Verified feed.json signature"
+
+            # Generate checksums.json
+            local feed_sha=$(sha256sum "$advisory_dir/feed.json" | awk '{print $1}')
+            local feed_size=$(stat -c%s "$advisory_dir/feed.json" 2>/dev/null || stat -f%z "$advisory_dir/feed.json")
+            local feed_sig_sha=$(sha256sum "$advisory_dir/feed.json.sig" | awk '{print $1}')
+            local feed_sig_size=$(stat -c%s "$advisory_dir/feed.json.sig" 2>/dev/null || stat -f%z "$advisory_dir/feed.json.sig")
+
+            jq -n \
+              --arg schema_version "1" \
+              --arg algorithm "sha256" \
+              --arg version "test" \
+              --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              --arg feed_sha "$feed_sha" \
+              --argjson feed_size "$feed_size" \
+              --arg feed_sig_sha "$feed_sig_sha" \
+              --argjson feed_sig_size "$feed_sig_size" \
+              '{
+                schema_version: $schema_version,
+                algorithm: $algorithm,
+                version: $version,
+                generated_at: $generated,
+                files: {
+                  "advisories/feed.json": {sha256: $feed_sha, size: $feed_size},
+                  "advisories/feed.json.sig": {sha256: $feed_sig_sha, size: $feed_sig_size}
+                }
+              }' > "$advisory_dir/checksums.json"
+
+            # Sign checksums.json with Ed25519 (requires -rawin flag)
+            openssl pkeyutl -sign -rawin -inkey "$key_file" -in "$advisory_dir/checksums.json" | \
+              openssl base64 -A > "$advisory_dir/checksums.json.sig"
+
+            # Verify Ed25519 checksums.json signature (requires -rawin flag)
+            tmp_sig_bin=$(mktemp)
+            openssl base64 -d -A -in "$advisory_dir/checksums.json.sig" -out "$tmp_sig_bin"
+            if ! openssl pkeyutl -verify -rawin -pubin -inkey "$pub_file" -sigfile "$tmp_sig_bin" -in "$advisory_dir/checksums.json" >/dev/null 2>&1; then
+              echo "::error file=${skill_dir}/advisories/checksums.json.sig::Checksums signature verification failed after signing"
+              rm -f "$tmp_sig_bin"
+              return 1
+            fi
+            rm -f "$tmp_sig_bin"
+            echo "  [Dry-run] Verified checksums.json signature"
+
+            # Copy public key
+            cp "$pub_file" "$advisory_dir/feed-signing-public.pem"
+
+            echo "  [Dry-run] Advisory artifacts signed and verified with test key"
+          }
+
+          get_md_version() {
+            local md_file="$1"
+            awk '
+              NR == 1 && $0 == "---" { in_frontmatter = 1; next }
+              in_frontmatter && $0 == "---" { exit }
+              in_frontmatter && $0 ~ /^version:[[:space:]]*/ {
+                sub(/^version:[[:space:]]*/, "", $0)
+                gsub(/[[:space:]]+$/, "", $0)
+                print $0
+                exit
+              }
+            ' "$md_file"
+          }
+
+          get_md_version_from_git() {
+            local sha="$1"
+            local path="$2"
+            local tmp_file
+            tmp_file="$(mktemp)"
+
+            if git cat-file -e "${sha}:${path}" 2>/dev/null; then
+              git show "${sha}:${path}" > "$tmp_file"
+              get_md_version "$tmp_file"
+            fi
+
+            rm -f "$tmp_file"
+          }
+
+          touched_skills_file="$(mktemp)"
+          git diff --name-only "${BASE_SHA}...${HEAD_SHA}" -- 'skills/*/skill.json' 'skills/*/SKILL.md' \
+            | awk -F/ 'NF >= 3 {print $1 "/" $2}' \
+            | sort -u > "${touched_skills_file}"
+
+          if [ ! -s "${touched_skills_file}" ]; then
+            echo "No skill metadata files changed in this PR."
+            rm -f "${touched_skills_file}"
+            exit 0
+          fi
+
+          dry_run_count=0
+          failures=0
+          mkdir -p dist/dry-run
+
+          while IFS= read -r skill_dir; do
+            json_path="${skill_dir}/skill.json"
+            md_path="${skill_dir}/SKILL.md"
+
+            head_json_version=""
+            if [ -f "${json_path}" ]; then
+              head_json_version="$(jq -r '.version // empty' "${json_path}" 2>/dev/null || true)"
+            fi
+
+            head_md_version=""
+            if [ -f "${md_path}" ]; then
+              head_md_version="$(get_md_version "${md_path}")"
+            fi
+
+            base_json_version=""
+            if git cat-file -e "${BASE_SHA}:${json_path}" 2>/dev/null; then
+              base_json_version="$(git show "${BASE_SHA}:${json_path}" | jq -r '.version // empty' 2>/dev/null || true)"
+            fi
+
+            base_md_version="$(get_md_version_from_git "${BASE_SHA}" "${md_path}")"
+
+            json_version_changed=false
+            md_version_changed=false
+
+            if [ "${head_json_version}" != "${base_json_version}" ]; then
+              json_version_changed=true
+            fi
+
+            if [ "${head_md_version}" != "${base_md_version}" ]; then
+              md_version_changed=true
+            fi
+
+            if [ "${json_version_changed}" != "true" ] && [ "${md_version_changed}" != "true" ]; then
+              echo "No version bump detected for ${skill_dir}; skipping dry-run."
+              continue
+            fi
+
+            if [ -z "${head_json_version}" ] || [ -z "${head_md_version}" ] || [ "${head_json_version}" != "${head_md_version}" ]; then
+              echo "::error file=${skill_dir}::Version metadata is invalid for dry-run. Ensure validate-pr-version-sync passes."
+              failures=$((failures + 1))
+              continue
+            fi
+
+            if [ ! -f "${json_path}" ]; then
+              echo "::error file=${json_path}::Missing skill.json."
+              failures=$((failures + 1))
+              continue
+            fi
+
+            if [ ! -f "${md_path}" ]; then
+              echo "::error file=${md_path}::Missing SKILL.md."
+              failures=$((failures + 1))
+              continue
+            fi
+
+            if ! jq -e '.name and .version and .sbom and .sbom.files and (.sbom.files | type == "array")' "${json_path}" >/dev/null 2>&1; then
+              echo "::error file=${json_path}::skill.json missing required release fields (name/version/sbom.files)."
+              failures=$((failures + 1))
+              continue
+            fi
+
+            skill_name="$(basename "${skill_dir}")"
+            version="${head_json_version}"
+            tag="${skill_name}-v${version}"
+            dry_run_count=$((dry_run_count + 1))
+
+            echo "::group::Dry-run release ${tag}"
+
+            out_root="dist/dry-run/${tag}"
+            out_assets="${out_root}/release-assets"
+            mkdir -p "${out_assets}"
+
+            # --- Sign advisory artifacts if present (dry-run with test key) ---
+            if ! sign_advisory_artifacts "${skill_dir}"; then
+              failures=$((failures + 1))
+              echo "::endgroup::"
+              continue
+            fi
+
+            # --- Stage SBOM files preserving directory structure ---
+            staging_dir="$(mktemp -d)"
+            inner_dir="${staging_dir}/${skill_name}"
+            mkdir -p "${inner_dir}"
+            temp_sbom_file="$(mktemp)"
+            jq -r '.sbom.files[].path' "${json_path}" > "${temp_sbom_file}"
+
+            while IFS= read -r file; do
+              [ -z "${file}" ] && continue
+              full_path="${skill_dir}/${file}"
+              if [ -f "${full_path}" ]; then
+                mkdir -p "${inner_dir}/$(dirname "${file}")"
+                cp "${full_path}" "${inner_dir}/${file}"
+              else
+                echo "::error file=${json_path}::SBOM references missing file: ${file}"
+                failures=$((failures + 1))
+              fi
+            done < "${temp_sbom_file}"
+
+            cp "${json_path}" "${inner_dir}/skill.json"
+
+            # --- Remove test-only artifacts from staging (don't include in release zip) ---
+            # The test signatures/keys were needed for SBOM validation but shouldn't ship
+            if [ -d "${inner_dir}/advisories" ]; then
+              rm -f "${inner_dir}/advisories/feed.json.sig"
+              rm -f "${inner_dir}/advisories/checksums.json"
+              rm -f "${inner_dir}/advisories/checksums.json.sig"
+              rm -f "${inner_dir}/advisories/feed-signing-public.pem"
+              echo "  [Dry-run] Removed test signatures from release staging"
+            fi
+
+            # --- Create zip preserving directory structure ---
+            zip_name="${skill_name}-v${version}.zip"
+            (cd "${staging_dir}" && zip -qr "${OLDPWD}/${out_assets}/${zip_name}" .)
+
+            # --- Clean up test artifacts from source directory ---
+            if [ -d "${skill_dir}/advisories" ]; then
+              rm -f "${skill_dir}/advisories/feed.json.sig"
+              rm -f "${skill_dir}/advisories/checksums.json"
+              rm -f "${skill_dir}/advisories/checksums.json.sig"
+              rm -f "${skill_dir}/advisories/feed-signing-public.pem"
+            fi
+
+            # --- Generate checksums.json via jq ---
+            files_json="{}"
+            while IFS= read -r file; do
+              [ -z "${file}" ] && continue
+              full_path="${skill_dir}/${file}"
+              if [ -f "${full_path}" ]; then
+                sha256="$(sha256sum "${full_path}" | awk '{print $1}')"
+                size="$(stat -c%s "${full_path}" 2>/dev/null || stat -f%z "${full_path}")"
+                files_json="$(echo "${files_json}" | jq \
+                  --arg key "${file}" \
+                  --arg sha "${sha256}" \
+                  --argjson sz "${size}" \
+                  '. + {($key): {sha256: $sha, size: $sz, path: $key}}')"
+              fi
+            done < "${temp_sbom_file}"
+
+            rm -f "${temp_sbom_file}"
+
+            skill_json_sha="$(sha256sum "${json_path}" | awk '{print $1}')"
+            skill_json_size="$(stat -c%s "${json_path}" 2>/dev/null || stat -f%z "${json_path}")"
+            files_json="$(echo "${files_json}" | jq \
+              --arg sha "${skill_json_sha}" \
+              --argjson sz "${skill_json_size}" \
+              '. + {"skill.json": {sha256: $sha, size: $sz}}')"
+
+            zip_sha="$(sha256sum "${out_assets}/${zip_name}" | awk '{print $1}')"
+            zip_size="$(stat -c%s "${out_assets}/${zip_name}" 2>/dev/null || stat -f%z "${out_assets}/${zip_name}")"
+
+            jq -n \
+              --arg skill "${skill_name}" \
+              --arg version "${version}" \
+              --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              --arg repo "${{ github.repository }}" \
+              --arg tag "${tag}" \
+              --arg zip_file "${zip_name}" \
+              --arg zip_sha "${zip_sha}" \
+              --argjson zip_size "${zip_size}" \
+              --arg zip_url "https://github.com/${{ github.repository }}/releases/download/${tag}/${zip_name}" \
+              --argjson files "${files_json}" \
+              '{
+                skill: $skill,
+                version: $version,
+                generated_at: $generated,
+                repository: $repo,
+                tag: $tag,
+                archive: {
+                  filename: $zip_file,
+                  sha256: $zip_sha,
+                  size: $zip_size,
+                  url: $zip_url
+                },
+                files: $files
+              }' > "${out_assets}/checksums.json"
+
+            if ! jq -e . "${out_assets}/checksums.json" >/dev/null 2>&1; then
+              echo "::error::Generated checksums.json is invalid JSON."
+              failures=$((failures + 1))
+              rm -rf "${staging_dir}"
+              echo "::endgroup::"
+              continue
+            fi
+
+            # --- Copy skill.json and root-level docs alongside the zip ---
+            cp "${json_path}" "${out_assets}/skill.json"
+            if [ -f "${skill_dir}/SKILL.md" ]; then
+              cp "${skill_dir}/SKILL.md" "${out_assets}/SKILL.md"
+            fi
+            if [ -f "${skill_dir}/README.md" ]; then
+              cp "${skill_dir}/README.md" "${out_assets}/README.md"
+            fi
+
+            rm -rf "${staging_dir}"
+
+            echo "Prepared dry-run assets for ${tag}:"
+            ls -la "${out_assets}"
+            echo "::endgroup::"
+          done < "${touched_skills_file}"
+
+          rm -f "${touched_skills_file}"
+
+          if [ "${failures}" -gt 0 ]; then
+            echo "::error::Release dry-run failed with ${failures} issue(s) across ${dry_run_count} skill(s)."
+            exit 1
+          fi
+
+          if [ "${dry_run_count}" -eq 0 ]; then
+            echo "No version bumps detected in changed skill metadata files."
+            exit 0
+          fi
+
+          echo "Release dry-run completed successfully for ${dry_run_count} changed skill(s)."
+
+  release-tag:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      skill_name: ${{ steps.parse.outputs.skill_name }}
+      version: ${{ steps.parse.outputs.version }}
+      skill_path: ${{ steps.parse.outputs.skill_path }}
+      publishable: ${{ steps.publishable.outputs.publishable }}
+    steps:
+      - name: Parse tag
+        id: parse
+        run: |
+          TAG="${{ github.ref_name }}"
+          # Extract skill name (everything before -v)
+          SKILL_NAME="${TAG%-v*}"
+          # Extract version (everything after -v)
+          VERSION="${TAG#*-v}"
+
+          echo "skill_name=${SKILL_NAME}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "skill_path=skills/${SKILL_NAME}" >> $GITHUB_OUTPUT
+
+          echo "Parsed tag: skill=${SKILL_NAME}, version=${VERSION}"
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Verify signing key consistency (repo + docs)
+        run: ./scripts/ci/verify_signing_key_consistency.sh
+
+      - name: Validate skill exists
+        run: |
+          SKILL_PATH="${{ steps.parse.outputs.skill_path }}"
+          if [ ! -d "$SKILL_PATH" ]; then
+            echo "Error: Skill directory not found: $SKILL_PATH"
+            exit 1
+          fi
+          if [ ! -f "$SKILL_PATH/skill.json" ]; then
+            echo "Error: skill.json not found in $SKILL_PATH"
+            exit 1
+          fi
+          echo "Skill validated: $SKILL_PATH"
+
+      - name: Validate version match
+        run: |
+          SKILL_PATH="${{ steps.parse.outputs.skill_path }}"
+          TAG_VERSION="${{ steps.parse.outputs.version }}"
+
+          # Extract version from skill.json
+          JSON_VERSION=$(jq -r '.version' "$SKILL_PATH/skill.json")
+
+          if [ "$TAG_VERSION" != "$JSON_VERSION" ]; then
+            echo "::error::Version mismatch! Tag version ($TAG_VERSION) != skill.json version ($JSON_VERSION)"
+            echo "Please ensure the version in $SKILL_PATH/skill.json matches your tag."
+            exit 1
+          fi
+
+          echo "Version validated: $TAG_VERSION"
+
+      - name: Validate SKILL.md frontmatter version
+        run: |
+          SKILL_PATH="${{ steps.parse.outputs.skill_path }}"
+          TAG_VERSION="${{ steps.parse.outputs.version }}"
+
+          # Check if SKILL.md exists
+          if [ -f "$SKILL_PATH/SKILL.md" ]; then
+            # Extract version from YAML frontmatter
+            MD_VERSION=$(grep -m 1 "^version:" "$SKILL_PATH/SKILL.md" | sed 's/version: *//' | tr -d '\r')
+
+            if [ -z "$MD_VERSION" ]; then
+              echo "::warning::No version found in $SKILL_PATH/SKILL.md frontmatter"
+            elif [ "$TAG_VERSION" != "$MD_VERSION" ]; then
+              echo "::error::Version mismatch! Tag version ($TAG_VERSION) != SKILL.md version ($MD_VERSION)"
+              echo "Please ensure the version in $SKILL_PATH/SKILL.md frontmatter matches your tag."
+              exit 1
+            else
+              echo "SKILL.md version validated: $MD_VERSION"
+            fi
+          else
+            echo "No SKILL.md found, skipping frontmatter validation"
+          fi
+
+      - name: Detect publishability
+        id: publishable
+        run: |
+          SKILL_PATH="${{ steps.parse.outputs.skill_path }}"
+          INTERNAL=$(jq -r '.openclaw.internal // false' "$SKILL_PATH/skill.json")
+
+          PUBLISHABLE=true
+          if [ "$INTERNAL" = "true" ]; then
+            PUBLISHABLE=false
+            echo "Skill marked internal=true; will skip ClawHub publish."
+          fi
+
+          echo "internal=${INTERNAL}" >> $GITHUB_OUTPUT
+          echo "publishable=${PUBLISHABLE}" >> $GITHUB_OUTPUT
+
+      - name: Setup Node
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+        with:
+          node-version: 20
+
+      - name: Sign embedded advisory feed and verify
+        if: hashFiles(format('skills/{0}/advisories/feed.json', steps.parse.outputs.skill_name)) != ''
+        uses: ./.github/actions/sign-and-verify
+        with:
+          private_key: ${{ secrets.CLAWSEC_SIGNING_PRIVATE_KEY }}
+          private_key_passphrase: ${{ secrets.CLAWSEC_SIGNING_PRIVATE_KEY_PASSPHRASE }}
+          input_file: skills/${{ steps.parse.outputs.skill_name }}/advisories/feed.json
+          signature_file: skills/${{ steps.parse.outputs.skill_name }}/advisories/feed.json.sig
+          public_key_output: skills/${{ steps.parse.outputs.skill_name }}/advisories/feed-signing-public.pem
+
+      - name: Generate embedded advisory checksums manifest
+        if: hashFiles(format('skills/{0}/advisories/feed.json', steps.parse.outputs.skill_name)) != ''
+        run: |
+          set -euo pipefail
+          ADVISORY_DIR="${{ steps.parse.outputs.skill_path }}/advisories"
+          FEED_SHA=$(sha256sum "$ADVISORY_DIR/feed.json" | awk '{print $1}')
+          FEED_SIZE=$(stat -c%s "$ADVISORY_DIR/feed.json" 2>/dev/null || stat -f%z "$ADVISORY_DIR/feed.json")
+          FEED_SIG_SHA=$(sha256sum "$ADVISORY_DIR/feed.json.sig" | awk '{print $1}')
+          FEED_SIG_SIZE=$(stat -c%s "$ADVISORY_DIR/feed.json.sig" 2>/dev/null || stat -f%z "$ADVISORY_DIR/feed.json.sig")
+
+          jq -n \
+            --arg schema_version "1" \
+            --arg algorithm "sha256" \
+            --arg version "${{ steps.parse.outputs.version }}" \
+            --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg repo "${{ github.repository }}" \
+            --arg feed_sha "$FEED_SHA" \
+            --argjson feed_size "$FEED_SIZE" \
+            --arg feed_sig_sha "$FEED_SIG_SHA" \
+            --argjson feed_sig_size "$FEED_SIG_SIZE" \
+            '{
+              schema_version: $schema_version,
+              algorithm: $algorithm,
+              version: $version,
+              generated_at: $generated,
+              repository: $repo,
+              files: {
+                "advisories/feed.json": {
+                  sha256: $feed_sha,
+                  size: $feed_size,
+                  path: "advisories/feed.json"
+                },
+                "advisories/feed.json.sig": {
+                  sha256: $feed_sig_sha,
+                  size: $feed_sig_size,
+                  path: "advisories/feed.json.sig"
+                }
+              }
+            }' > "$ADVISORY_DIR/checksums.json"
+
+          echo "Generated $ADVISORY_DIR/checksums.json"
+          jq . "$ADVISORY_DIR/checksums.json"
+
+      - name: Sign embedded advisory checksums and verify
+        if: hashFiles(format('skills/{0}/advisories/feed.json', steps.parse.outputs.skill_name)) != ''
+        uses: ./.github/actions/sign-and-verify
+        with:
+          private_key: ${{ secrets.CLAWSEC_SIGNING_PRIVATE_KEY }}
+          private_key_passphrase: ${{ secrets.CLAWSEC_SIGNING_PRIVATE_KEY_PASSPHRASE }}
+          input_file: skills/${{ steps.parse.outputs.skill_name }}/advisories/checksums.json
+          signature_file: skills/${{ steps.parse.outputs.skill_name }}/advisories/checksums.json.sig
+
+      - name: Show embedded advisory signing outputs
+        if: hashFiles(format('skills/{0}/advisories/feed.json', steps.parse.outputs.skill_name)) != ''
+        run: |
+          ADVISORY_DIR="${{ steps.parse.outputs.skill_path }}/advisories"
+          echo "Successfully signed embedded advisory artifacts:"
+          ls -la "$ADVISORY_DIR"
+
+      - name: Package release assets
+        run: |
+          set -euo pipefail
+          SKILL_NAME="${{ steps.parse.outputs.skill_name }}"
+          SKILL_PATH="${{ steps.parse.outputs.skill_path }}"
+          VERSION="${{ steps.parse.outputs.version }}"
+          TAG="${{ github.ref_name }}"
+
+          mkdir -p release-assets
+
+          # --- Stage SBOM files preserving directory structure ---
+          STAGING_DIR="$(mktemp -d)"
+          INNER_DIR="$STAGING_DIR/$SKILL_NAME"
+          mkdir -p "$INNER_DIR"
+          TEMPFILE="$(mktemp)"
+          jq -r '.sbom.files[].path' "$SKILL_PATH/skill.json" > "$TEMPFILE"
+
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            FULL_PATH="$SKILL_PATH/$file"
+            if [ -f "$FULL_PATH" ]; then
+              mkdir -p "$INNER_DIR/$(dirname "$file")"
+              cp "$FULL_PATH" "$INNER_DIR/$file"
+            else
+              echo "::error file=$SKILL_PATH/skill.json::SBOM references missing file: $file"
+              exit 1
+            fi
+          done < "$TEMPFILE"
+
+          cp "$SKILL_PATH/skill.json" "$INNER_DIR/skill.json"
+
+          # --- Create zip preserving directory structure ---
+          ZIP_NAME="${SKILL_NAME}-v${VERSION}.zip"
+          (cd "$STAGING_DIR" && zip -qr "$OLDPWD/release-assets/$ZIP_NAME" .)
+
+          # --- Generate checksums.json via jq ---
+          FILES_JSON="{}"
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            FULL_PATH="$SKILL_PATH/$file"
+            if [ -f "$FULL_PATH" ]; then
+              SHA256=$(sha256sum "$FULL_PATH" | awk '{print $1}')
+              SIZE=$(stat -c%s "$FULL_PATH" 2>/dev/null || stat -f%z "$FULL_PATH")
+              FILES_JSON="$(echo "$FILES_JSON" | jq \
+                --arg key "$file" \
+                --arg sha "$SHA256" \
+                --argjson sz "$SIZE" \
+                '. + {($key): {sha256: $sha, size: $sz, path: $key}}')"
+            fi
+          done < "$TEMPFILE"
+
+          rm -f "$TEMPFILE"
+
+          SKILL_JSON_SHA=$(sha256sum "$SKILL_PATH/skill.json" | awk '{print $1}')
+          SKILL_JSON_SIZE=$(stat -c%s "$SKILL_PATH/skill.json" 2>/dev/null || stat -f%z "$SKILL_PATH/skill.json")
+          FILES_JSON="$(echo "$FILES_JSON" | jq \
+            --arg sha "$SKILL_JSON_SHA" \
+            --argjson sz "$SKILL_JSON_SIZE" \
+            '. + {"skill.json": {sha256: $sha, size: $sz}}')"
+
+          ZIP_SHA=$(sha256sum "release-assets/$ZIP_NAME" | awk '{print $1}')
+          ZIP_SIZE=$(stat -c%s "release-assets/$ZIP_NAME" 2>/dev/null || stat -f%z "release-assets/$ZIP_NAME")
+
+          jq -n \
+            --arg skill "$SKILL_NAME" \
+            --arg version "$VERSION" \
+            --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg repo "${{ github.repository }}" \
+            --arg tag "$TAG" \
+            --arg zip_file "$ZIP_NAME" \
+            --arg zip_sha "$ZIP_SHA" \
+            --argjson zip_size "$ZIP_SIZE" \
+            --arg zip_url "https://github.com/${{ github.repository }}/releases/download/$TAG/$ZIP_NAME" \
+            --argjson files "$FILES_JSON" \
+            '{
+              skill: $skill,
+              version: $version,
+              generated_at: $generated,
+              repository: $repo,
+              tag: $tag,
+              archive: {
+                filename: $zip_file,
+                sha256: $zip_sha,
+                size: $zip_size,
+                url: $zip_url
+              },
+              files: $files
+            }' > "release-assets/checksums.json"
+
+          # --- Copy skill.json and root-level docs alongside the zip ---
+          cp "$SKILL_PATH/skill.json" release-assets/skill.json
+          if [ -f "$SKILL_PATH/SKILL.md" ]; then
+            cp "$SKILL_PATH/SKILL.md" release-assets/
+          fi
+          if [ -f "$SKILL_PATH/README.md" ]; then
+            cp "$SKILL_PATH/README.md" release-assets/
+          fi
+
+          rm -rf "$STAGING_DIR"
+
+          echo "=== checksums.json ==="
+          jq . "release-assets/checksums.json"
+          echo ""
+          echo "=== Release assets ==="
+          ls -la release-assets/
+
+      - name: Sign checksums and verify
+        uses: ./.github/actions/sign-and-verify
+        with:
+          private_key: ${{ secrets.CLAWSEC_SIGNING_PRIVATE_KEY }}
+          private_key_passphrase: ${{ secrets.CLAWSEC_SIGNING_PRIVATE_KEY_PASSPHRASE }}
+          input_file: release-assets/checksums.json
+          signature_file: release-assets/checksums.sig
+          public_key_output: release-assets/signing-public.pem
+
+      - name: Verify generated release signing key matches canonical key
+        run: |
+          set -euo pipefail
+          CANONICAL_FPR=$(openssl pkey -pubin -in clawsec-signing-public.pem -outform DER | sha256sum | awk '{print $1}')
+          GENERATED_FPR=$(openssl pkey -pubin -in release-assets/signing-public.pem -outform DER | sha256sum | awk '{print $1}')
+          echo "Canonical key fingerprint: $CANONICAL_FPR"
+          echo "Generated key fingerprint: $GENERATED_FPR"
+          if [ "$CANONICAL_FPR" != "$GENERATED_FPR" ]; then
+            echo "::error::release-assets/signing-public.pem fingerprint mismatch vs clawsec-signing-public.pem"
+            exit 1
+          fi
+
+      - name: Show signed release assets
+        run: |
+          echo "Signed and verified release-assets/checksums.json"
+          ls -la release-assets/
+
+      - name: Extract changelog entry
+        id: changelog
+        run: |
+          set -euo pipefail
+          SKILL_PATH="${{ steps.parse.outputs.skill_path }}"
+          VERSION="${{ steps.parse.outputs.version }}"
+
+          if [ ! -f "$SKILL_PATH/CHANGELOG.md" ]; then
+            echo "No CHANGELOG.md found"
+            echo "changelog=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Extract the changelog section for this version
+          # Pattern: ## [VERSION] - DATE ... until next ## [, separator (---), or any other ## heading
+          CHANGELOG_ENTRY=$(awk -v version="$VERSION" '
+            BEGIN { in_section = 0; found = 0 }
+            $0 ~ ("^## \\[" version "\\]") { in_section = 1; found = 1; next }
+            in_section && found && /^---/ { exit }
+            in_section && found && /^## / { exit }
+            in_section { print }
+          ' "$SKILL_PATH/CHANGELOG.md" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')
+
+          if [ -z "$CHANGELOG_ENTRY" ]; then
+            echo "No changelog entry found for version $VERSION"
+            echo "changelog=" >> $GITHUB_OUTPUT
+          else
+            echo "Found changelog entry for version $VERSION"
+            # Use multiline output format for GitHub Actions
+            {
+              echo "changelog<<EOF"
+              echo "$CHANGELOG_ENTRY"
+              echo "EOF"
+            } >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
+        with:
+          name: "${{ steps.parse.outputs.skill_name }} ${{ steps.parse.outputs.version }}"
+          tag_name: ${{ github.ref_name }}
+          files: release-assets/*
+          body: |
+            ## ${{ steps.parse.outputs.skill_name }} ${{ steps.parse.outputs.version }}
+
+            ${{ steps.changelog.outputs.changelog }}
+
+            ### Quick Install
+
+            **Via clawhub (recommended):**
+            ```bash
+            npx clawhub@latest install ${{ steps.parse.outputs.skill_name }}
+            ```
+
+            **Manual download with verification:**
+            ```bash
+            # 1. Download the release archive, checksums, and signing material
+            curl -sLO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ steps.parse.outputs.skill_name }}-v${{ steps.parse.outputs.version }}.zip
+            curl -sLO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/checksums.json
+            curl -sLO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/checksums.sig
+            curl -sLO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/signing-public.pem
+
+            # 2. Verify the checksums manifest signature (Ed25519)
+            openssl base64 -d -A -in checksums.sig -out checksums.sig.bin
+            openssl pkeyutl -verify -rawin -pubin -inkey signing-public.pem -sigfile checksums.sig.bin -in checksums.json
+
+            # 3. Verify archive checksum from the signed manifest
+            echo "$(jq -r '.archive.sha256' checksums.json)  ${{ steps.parse.outputs.skill_name }}-v${{ steps.parse.outputs.version }}.zip" | sha256sum -c
+
+            # 4. Extract (creates ${{ steps.parse.outputs.skill_name }}/ directory)
+            unzip ${{ steps.parse.outputs.skill_name }}-v${{ steps.parse.outputs.version }}.zip
+            ```
+
+            ### Verification
+
+            `checksums.json` is cryptographically signed (`checksums.sig`) using the ClawSec CI signing key.
+            Verify the signature first, then trust hashes from `checksums.json`:
+            ```bash
+            curl -sLO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/checksums.json
+            curl -sLO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/checksums.sig
+            curl -sLO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/signing-public.pem
+            openssl base64 -d -A -in checksums.sig -out checksums.sig.bin
+            openssl pkeyutl -verify -rawin -pubin -inkey signing-public.pem -sigfile checksums.sig.bin -in checksums.json
+            ```
+
+            ### Files
+
+            See `checksums.json` for the complete file manifest with SHA256 hashes.
+            The zip archive preserves the full directory structure of the skill.
+
+            ---
+            *Released by ClawSec skill distribution pipeline*
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete superseded releases
+        run: |
+          SKILL_NAME="${{ steps.parse.outputs.skill_name }}"
+          CURRENT_VERSION="${{ steps.parse.outputs.version }}"
+
+          # Extract major version from current release
+          CURRENT_MAJOR=$(echo "$CURRENT_VERSION" | cut -d. -f1)
+
+          echo "Current release: $SKILL_NAME v$CURRENT_VERSION (major: $CURRENT_MAJOR)"
+
+          # List all releases for this skill
+          gh release list --limit 100 | grep "^${SKILL_NAME} " | while read -r line; do
+            # Extract tag from release list (3rd tab-delimited column)
+            TAG=$(echo "$line" | awk -F'\t' '{print $3}')
+            VERSION="${TAG#${SKILL_NAME}-v}"
+
+            # Skip current version
+            if [ "$VERSION" = "$CURRENT_VERSION" ]; then
+              continue
+            fi
+
+            # Extract major version
+            RELEASE_MAJOR=$(echo "$VERSION" | cut -d. -f1)
+
+            # Only delete if same major version (preserve old majors for backwards compat)
+            if [ "$RELEASE_MAJOR" = "$CURRENT_MAJOR" ]; then
+              echo "Deleting $TAG (superseded by v$CURRENT_VERSION)"
+              gh release delete "$TAG" --yes || echo "Warning: Could not delete $TAG"
+            else
+              echo "Keeping $TAG as latest for major version $RELEASE_MAJOR"
+            fi
+          done
+
+          echo "Superseded release cleanup complete"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-clawhub:
+    # Separate job for ClawHub publishing - runs after GitHub release
+    # Non-blocking: if this fails, the release is still successful
+    # Retriggerable: can be manually triggered for failed publishes
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: release-tag
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+    env:
+      CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
+    steps:
+      - name: Check if publishable
+        if: needs.release-tag.outputs.publishable != 'true'
+        run: |
+          echo "Skill marked as internal, skipping ClawHub publish"
+          exit 0
+
+      - name: Checkout
+        if: needs.release-tag.outputs.publishable == 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup Node
+        if: needs.release-tag.outputs.publishable == 'true'
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+        with:
+          node-version: 20
+
+      - name: Install clawhub CLI
+        if: needs.release-tag.outputs.publishable == 'true' && env.CLAWHUB_TOKEN != ''
+        run: npm install -g clawhub@0.7.0
+
+      - name: Login to ClawHub
+        if: needs.release-tag.outputs.publishable == 'true' && env.CLAWHUB_TOKEN != ''
+        run: |
+          set -euo pipefail
+          SITE=${CLAWHUB_SITE:-https://clawhub.ai}
+          REGISTRY=${CLAWHUB_REGISTRY:-$SITE}
+          export CLAWHUB_CONFIG_PATH="$HOME/.clawhub-ci/config.json"
+          mkdir -p "$(dirname "$CLAWHUB_CONFIG_PATH")"
+          CLAWHUB_DISABLE_TELEMETRY=1 CLAWHUB_SITE="$SITE" CLAWHUB_REGISTRY="$REGISTRY" \
+            clawhub login --token "$CLAWHUB_TOKEN" --site "$SITE" --no-input
+
+      - name: Publish to ClawHub
+        if: needs.release-tag.outputs.publishable == 'true' && env.CLAWHUB_TOKEN != ''
+        run: |
+          set -euo pipefail
+          SITE=${CLAWHUB_SITE:-https://clawhub.ai}
+          REGISTRY=${CLAWHUB_REGISTRY:-$SITE}
+          SKILL_PATH="${{ needs.release-tag.outputs.skill_path }}"
+          SKILL_NAME="${{ needs.release-tag.outputs.skill_name }}"
+          VERSION="${{ needs.release-tag.outputs.version }}"
+          NAME=$(jq -r '.name' "$SKILL_PATH/skill.json")
+          CHANGELOG="Release ${VERSION} via CI"
+
+          export CLAWHUB_CONFIG_PATH="$HOME/.clawhub-ci/config.json"
+
+          # Publish with idempotent retry handling
+          if ! CLAWHUB_DISABLE_TELEMETRY=1 CLAWHUB_SITE="$SITE" CLAWHUB_REGISTRY="$REGISTRY" \
+            clawhub publish "$SKILL_PATH" \
+              --slug "$SKILL_NAME" \
+              --name "$NAME" \
+              --version "$VERSION" \
+              --changelog "$CHANGELOG" \
+              --tags "latest" \
+              --no-input 2>&1 | tee /tmp/clawhub-publish.log; then
+
+            # Check if it's a "version already exists" error (which means previous run partially succeeded)
+            if grep -qi "version already exists" /tmp/clawhub-publish.log; then
+              echo "::warning::Version $VERSION already published to ClawHub (from previous run)"
+              exit 0
+            else
+              echo "::error::ClawHub publish failed. Check logs above for details."
+              exit 1
+            fi
+          fi
+
+          echo "✓ Successfully published $SKILL_NAME@$VERSION to ClawHub"
+
+  republish-clawhub:
+    # Manual workflow to republish a specific tag to ClawHub
+    # Usage: Go to Actions → Skill Release → Run workflow → Enter tag name
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
+    steps:
+      - name: Parse tag
+        id: parse
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          # Extract skill name (everything before -v)
+          SKILL_NAME="${TAG%-v*}"
+          # Extract version (everything after -v)
+          VERSION="${TAG#*-v}"
+
+          echo "skill_name=${SKILL_NAME}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "skill_path=skills/${SKILL_NAME}" >> $GITHUB_OUTPUT
+
+          echo "Parsed tag: skill=${SKILL_NAME}, version=${VERSION}"
+
+      - name: Checkout tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.inputs.tag }}
+
+      - name: Validate skill exists
+        run: |
+          SKILL_PATH="${{ steps.parse.outputs.skill_path }}"
+          if [ ! -d "$SKILL_PATH" ]; then
+            echo "Error: Skill directory not found: $SKILL_PATH"
+            exit 1
+          fi
+          if [ ! -f "$SKILL_PATH/skill.json" ]; then
+            echo "Error: skill.json not found in $SKILL_PATH"
+            exit 1
+          fi
+          echo "Skill validated: $SKILL_PATH"
+
+      - name: Check if publishable
+        id: publishable
+        run: |
+          SKILL_PATH="${{ steps.parse.outputs.skill_path }}"
+          INTERNAL=$(jq -r '.openclaw.internal // false' "$SKILL_PATH/skill.json")
+
+          if [ "$INTERNAL" = "true" ]; then
+            echo "::error::Skill is marked internal and cannot be published to ClawHub"
+            exit 1
+          fi
+
+          echo "Skill is publishable to ClawHub"
+
+      - name: Setup Node
+        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+        with:
+          node-version: 20
+
+      - name: Install clawhub CLI
+        run: npm install -g clawhub@0.7.0
+
+      - name: Login to ClawHub
+        run: |
+          set -euo pipefail
+          if [ -z "$CLAWHUB_TOKEN" ]; then
+            echo "::error::CLAWHUB_TOKEN secret is not set"
+            exit 1
+          fi
+
+          SITE=${CLAWHUB_SITE:-https://clawhub.ai}
+          REGISTRY=${CLAWHUB_REGISTRY:-$SITE}
+          export CLAWHUB_CONFIG_PATH="$HOME/.clawhub-ci/config.json"
+          mkdir -p "$(dirname "$CLAWHUB_CONFIG_PATH")"
+          CLAWHUB_DISABLE_TELEMETRY=1 CLAWHUB_SITE="$SITE" CLAWHUB_REGISTRY="$REGISTRY" \
+            clawhub login --token "$CLAWHUB_TOKEN" --site "$SITE" --no-input
+
+      - name: Publish to ClawHub
+        run: |
+          set -euo pipefail
+          SITE=${CLAWHUB_SITE:-https://clawhub.ai}
+          REGISTRY=${CLAWHUB_REGISTRY:-$SITE}
+          SKILL_PATH="${{ steps.parse.outputs.skill_path }}"
+          SKILL_NAME="${{ steps.parse.outputs.skill_name }}"
+          VERSION="${{ steps.parse.outputs.version }}"
+          NAME=$(jq -r '.name' "$SKILL_PATH/skill.json")
+          CHANGELOG="Manual republish of ${VERSION} via workflow_dispatch"
+
+          export CLAWHUB_CONFIG_PATH="$HOME/.clawhub-ci/config.json"
+
+          echo "Publishing $SKILL_NAME@$VERSION to ClawHub..."
+
+          # Publish with idempotent retry handling
+          if ! CLAWHUB_DISABLE_TELEMETRY=1 CLAWHUB_SITE="$SITE" CLAWHUB_REGISTRY="$REGISTRY" \
+            clawhub publish "$SKILL_PATH" \
+              --slug "$SKILL_NAME" \
+              --name "$NAME" \
+              --version "$VERSION" \
+              --changelog "$CHANGELOG" \
+              --tags "latest" \
+              --no-input 2>&1 | tee /tmp/clawhub-publish.log; then
+
+            # Check if it's a "version already exists" error (which is OK on retry)
+            if grep -qi "version already exists" /tmp/clawhub-publish.log; then
+              echo "::warning::Version $VERSION already published to ClawHub"
+              echo "This is expected if you're retrying a failed publish."
+              echo "✓ Skill is available on ClawHub"
+              exit 0
+            else
+              echo "::error::ClawHub publish failed. Check logs above for details."
+              cat /tmp/clawhub-publish.log
+              exit 1
+            fi
+          fi
+
+          echo "✓ Successfully published $SKILL_NAME@$VERSION to ClawHub"
