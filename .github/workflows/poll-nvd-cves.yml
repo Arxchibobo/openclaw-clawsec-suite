@@ -705,11 +705,11 @@ jobs:
 
           if [ -f "$FEED_PATH" ] && [ "$FORCE_FULL_SCAN" = "true" ]; then
             # Full scan mode: replace all CVE advisories with rebuilt set and keep non-CVE entries.
-            jq --argjson rebuilt "$(cat tmp/new_advisories.json)" --arg now "$NOW" '
+            jq --slurpfile rebuilt tmp/new_advisories.json --arg now "$NOW" '
               .updated = $now |
               .advisories = (
                 ((.advisories // []) | map(select((.id // "") | startswith("CVE-") | not)))
-                + $rebuilt
+                + $rebuilt[0]
                 | sort_by(.published)
                 | reverse
               )
@@ -731,16 +731,16 @@ jobs:
             ' "$FEED_PATH" > tmp/feed_with_updates.json
 
             # Step 2: Add new advisories
-            jq --argjson new "$(cat tmp/new_advisories.json)" --arg now "$NOW" '
+            jq --slurpfile new tmp/new_advisories.json --arg now "$NOW" '
               .updated = $now |
-              .advisories = (.advisories + $new | sort_by(.published) | reverse)
+              .advisories = (.advisories + $new[0] | sort_by(.published) | reverse)
             ' tmp/feed_with_updates.json > tmp/updated_feed.json
           else
-            jq -n --argjson advisories "$(cat tmp/new_advisories.json)" --arg now "$NOW" '{
+            jq -n --slurpfile advisories tmp/new_advisories.json --arg now "$NOW" '{
               version: "1.0.0",
               updated: $now,
               description: "Community-driven security advisory feed for ClawSec",
-              advisories: ($advisories | sort_by(.published) | reverse)
+              advisories: ($advisories[0] | sort_by(.published) | reverse)
             }' > tmp/updated_feed.json
           fi
 
