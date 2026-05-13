@@ -42,9 +42,13 @@ jobs:
         with:
           python-version: '3.12'
       - name: Ruff (lint + format check)
-        run: pipx run --spec "ruff==0.6.9" ruff check utils/ --output-format=github
+        run: |
+          ruff_spec="$(grep '^ruff==' .github/requirements-lint-python.txt)"
+          pipx run --spec "$ruff_spec" ruff check utils/ --output-format=github
       - name: Bandit (security)
-        run: pipx run --spec "bandit==1.7.9" bandit -r utils/ -ll
+        run: |
+          bandit_spec="$(grep '^bandit==' .github/requirements-lint-python.txt)"
+          pipx run --spec "$bandit_spec" bandit -r utils/ -ll
 
   lint-shell:
     name: Lint Shell Scripts
