@@ -7,12 +7,14 @@
  */
 
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { pass, fail, report, exitWithResults, withEnv } from "./lib/test_harness.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const LIB_PATH = path.resolve(__dirname, "..", "hooks", "clawsec-advisory-guardian", "lib");
-const { resolveUserPath, resolveConfiguredPath } = await import(`${LIB_PATH}/utils.mjs`);
+const { resolveUserPath, resolveConfiguredPath } = await import(
+  pathToFileURL(path.join(LIB_PATH, "utils.mjs")).href,
+);
 
 async function testTildeExpansion() {
   const testName = "resolveUserPath: expands leading tilde";
@@ -99,18 +101,20 @@ async function testConfiguredPathFallbackOnInvalidExplicit() {
 async function testConfiguredPathUsesValidExplicit() {
   const testName = "resolveConfiguredPath: keeps valid explicit value";
   try {
-    const resolved = resolveConfiguredPath("$HOME/skills", "/tmp/clawsec-default", {
-      label: "CLAWSEC_INSTALL_ROOT",
-      onInvalid: () => {
-        throw new Error("onInvalid should not run for a valid explicit path");
-      },
+    await withEnv("HOME", "/tmp/clawsec-home", async () => {
+      const resolved = resolveConfiguredPath("$HOME/skills", "/tmp/clawsec-default", {
+        label: "CLAWSEC_INSTALL_ROOT",
+        onInvalid: () => {
+          throw new Error("onInvalid should not run for a valid explicit path");
+        },
+      });
+      const expected = path.normalize("/tmp/clawsec-home/skills");
+      if (resolved === expected) {
+        pass(testName);
+      } else {
+        fail(testName, `Expected ${expected}, got ${resolved}`);
+      }
     });
-    const expected = path.normalize(`${process.env.HOME || ""}/skills`);
-    if (resolved === expected) {
-      pass(testName);
-    } else {
-      fail(testName, `Expected ${expected}, got ${resolved}`);
-    }
   } catch (error) {
     fail(testName, error);
   }

@@ -23,21 +23,21 @@
   },
   "devDependencies": {
     "@eslint/js": "~9.28.0",
-    "@types/node": "^25.2.3",
+    "@types/node": "^25.5.0",
     "@typescript-eslint/eslint-plugin": "^8.55.0",
     "@typescript-eslint/parser": "^8.56.0",
     "@vitejs/plugin-react": "^5.1.4",
     "eslint": "^9.39.2",
     "eslint-plugin-react": "^7.37.5",
     "eslint-plugin-react-hooks": "^7.0.1",
-    "fast-check": "^4.5.3",
+    "fast-check": "^4.6.0",
     "typescript": "~5.8.2",
     "vite": "^7.3.1"
   },
   "overrides": {
     "ajv": "6.14.0",
     "balanced-match": "4.0.3",
-    "brace-expansion": "5.0.2",
-    "minimatch": "10.2.4"
+    "brace-expansion": "5.0.6",
+    "minimatch": "10.2.5"
   }
 }

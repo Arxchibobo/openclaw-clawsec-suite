@@ -20,7 +20,7 @@ jobs:
           - windows-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
           node-version: '20'
           cache: 'npm'
@@ -42,9 +42,13 @@ jobs:
         with:
           python-version: '3.12'
       - name: Ruff (lint + format check)
-        run: pipx run --spec "ruff==0.6.9" ruff check utils/ --output-format=github
+        run: |
+          ruff_spec="$(grep '^ruff==' .github/requirements-lint-python.txt)"
+          pipx run --spec "$ruff_spec" ruff check utils/ --output-format=github
       - name: Bandit (security)
-        run: pipx run --spec "bandit==1.7.9" bandit -r utils/ -ll
+        run: |
+          bandit_spec="$(grep '^bandit==' .github/requirements-lint-python.txt)"
+          pipx run --spec "$bandit_spec" bandit -r utils/ -ll
 
   lint-shell:
     name: Lint Shell Scripts
@@ -83,7 +87,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
           node-version: '20'
           cache: 'npm'
@@ -98,7 +102,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
           node-version: '20'
           cache: 'npm'
@@ -123,7 +127,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
           node-version: '20'
           cache: 'npm'

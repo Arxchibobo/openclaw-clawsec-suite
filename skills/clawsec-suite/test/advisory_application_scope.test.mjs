@@ -10,12 +10,14 @@
  */
 
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { pass, fail, report, exitWithResults } from "./lib/test_harness.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const LIB_PATH = path.resolve(__dirname, "..", "hooks", "clawsec-advisory-guardian", "lib");
-const { advisoryAppliesToOpenclaw } = await import(`${LIB_PATH}/advisory_scope.mjs`);
+const { advisoryAppliesToOpenclaw } = await import(
+  pathToFileURL(path.join(LIB_PATH, "advisory_scope.mjs")).href,
+);
 
 function testFindMatchesFiltersByApplicationScope() {
   const testName = "advisoryAppliesToOpenclaw: openclaw + legacy advisories are considered";
