@@ -16,14 +16,14 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { pass, fail, report, exitWithResults, createTempDir } from "./lib/test_harness.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const LIB_PATH = path.resolve(__dirname, "..", "hooks", "clawsec-advisory-guardian", "lib");
 
 const { isAdvisorySuppressed, loadAdvisorySuppression } = await import(
-  `${LIB_PATH}/suppression.mjs`
+  pathToFileURL(path.join(LIB_PATH, "suppression.mjs")).href,
 );
 
 let tempDir;

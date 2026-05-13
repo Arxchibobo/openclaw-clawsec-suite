@@ -15,7 +15,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   pass,
   fail,
@@ -31,7 +31,7 @@ const LIB_PATH = path.resolve(__dirname, "..", "hooks", "clawsec-advisory-guardi
 
 // Dynamic import to ensure we test the actual module
 const { verifySignedPayload, loadLocalFeed, isValidFeedPayload } = await import(
-  `${LIB_PATH}/feed.mjs`
+  pathToFileURL(path.join(LIB_PATH, "feed.mjs")).href,
 );
 
 let tempDirCleanup;
